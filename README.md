@@ -150,11 +150,18 @@ Add this to your Claude Code settings:
   "mcpServers": {
     "deep-zotero": {
       "command": "/path/to/repo/.venv/bin/python",
-      "args": ["-m", "deep_zotero.server"]
+      "args": ["/path/to/repo/tools/mcp_server_launcher.py"]
     }
   }
 }
 ```
+
+Use the launcher instead of calling `deep_zotero.server` directly when you run
+with `embedding_provider: "openai_compatible"` and `embedding_auto_start: true`.
+The launcher probes the configured `/v1/embeddings` endpoint, starts the bundled
+Qwen embedding server when needed, and then hands off to the MCP stdio server.
+It also prefers a complete local Hugging Face snapshot and falls back to the
+shared Hugging Face cache if the dedicated cache only contains partial downloads.
 
 Restart the client after updating MCP config.
 

@@ -2,7 +2,7 @@
   "mcpServers": {
     "deep-zotero": {
       "command": "D:\\pyproject\\deep-zotero-opt\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "deep_zotero.server"]
+      "args": ["D:\\pyproject\\deep-zotero-opt\\tools\\mcp_server_launcher.py"]
     }
   }
 }
