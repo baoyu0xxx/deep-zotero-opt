@@ -21,6 +21,7 @@ from .reranker import (
 from .models import RetrievalResult
 
 logger = logging.getLogger(__name__)
+PARENT_MONITOR_ENV = "DEEP_ZOTERO_PARENT_MONITOR"
 
 # Try to import FastMCP's error type; define fallback if not available
 try:
@@ -31,54 +32,11 @@ except ImportError:
         pass
 
 
-def _get_ancestor_pid():
-    """
-    Get the PID to monitor for parent death.
-
-    On Windows with subprocess.Popen, there may be an intermediate process
-    between the actual parent (Claude Code) and this process. We need to
-    find the real parent by walking up the process tree.
-    """
-    if sys.platform != 'win32':
-        return os.getppid()
-
-    import ctypes
-    from ctypes import wintypes
-
-    ntdll = ctypes.WinDLL('ntdll')
-
-    class PROCESS_BASIC_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ('Reserved1', ctypes.c_void_p),
-            ('PebBaseAddress', ctypes.c_void_p),
-            ('Reserved2', ctypes.c_void_p * 2),
-            ('UniqueProcessId', wintypes.HANDLE),
-            ('InheritedFromUniqueProcessId', wintypes.HANDLE),
-        ]
-
-    kernel32 = ctypes.windll.kernel32
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-    def get_parent_pid(pid):
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return None
-        pbi = PROCESS_BASIC_INFORMATION()
-        ret_len = ctypes.c_ulong()
-        status = ntdll.NtQueryInformationProcess(
-            handle, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(ret_len)
-        )
-        kernel32.CloseHandle(handle)
-        if status == 0:
-            return int(pbi.InheritedFromUniqueProcessId)
-        return None
-
-    # Get parent and grandparent
-    parent_pid = os.getppid()
-    grandparent_pid = get_parent_pid(parent_pid)
-
-    # Return grandparent if available (skips intermediate process), else parent
-    return grandparent_pid if grandparent_pid else parent_pid
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 def _start_parent_monitor():
@@ -89,7 +47,11 @@ def _start_parent_monitor():
     also exit. Without this monitor, the asyncio event loop may hang
     indefinitely, leaving orphaned processes that consume CPU.
     """
-    target_pid = _get_ancestor_pid()
+    if not _env_flag(PARENT_MONITOR_ENV, True):
+        logger.info("Parent monitor disabled via %s", PARENT_MONITOR_ENV)
+        return
+
+    target_pid = os.getppid()
 
     def monitor():
         if sys.platform == 'win32':
@@ -118,9 +80,6 @@ def _start_parent_monitor():
     thread = threading.Thread(target=monitor, daemon=True)
     thread.start()
 
-
-# Start parent monitor before anything else
-_start_parent_monitor()
 
 mcp = FastMCP("deep-zotero")
 
@@ -1592,4 +1551,5 @@ def get_vision_costs(last_n: int = 10) -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    _start_parent_monitor()
+    mcp.run(show_banner=False, log_level="error")
