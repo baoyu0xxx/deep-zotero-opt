@@ -1,4 +1,4 @@
-"""Embedding services: Gemini API and local (ChromaDB default)."""
+"""Embedding services: Gemini API, OpenAI-compatible API, and local fallback."""
 import logging
 import time
 import concurrent.futures
@@ -193,6 +193,143 @@ class LocalEmbedder:
         return self.embed(texts)
 
 
+class OpenAICompatibleEmbedder:
+    """Embedding client for OpenAI-compatible /v1/embeddings endpoints."""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key: str,
+        dimensions: int,
+        query_instruction: str | None = None,
+        batch_size: int = 8,
+        timeout: float = 120.0,
+        max_retries: int = 3,
+    ):
+        from openai import OpenAI
+
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=0,
+        )
+        self.model = model
+        self.dimensions = dimensions
+        self.query_instruction = query_instruction
+        self.batch_size = max(1, batch_size)
+        self.max_retries = max_retries
+
+    def _prepare_texts(self, texts: list[str], task_type: str) -> list[str]:
+        if task_type == "RETRIEVAL_QUERY" and self.query_instruction:
+            return [f"{self.query_instruction}\n{text}" for text in texts]
+        return texts
+
+    def _embed_batch(self, batch: list[str], task_type: str, batch_num: int, total_batches: int) -> list[list[float]]:
+        prepared = self._prepare_texts(batch, task_type)
+        total_chars = sum(len(text) for text in batch)
+        logger.debug(
+            "OpenAI-compatible embedding batch %d/%d: %d texts, %d chars",
+            batch_num,
+            total_batches,
+            len(batch),
+            total_chars,
+        )
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    input=prepared,
+                )
+                embeddings = [item.embedding for item in response.data]
+                logger.debug(
+                    "OpenAI-compatible embedding batch %d/%d succeeded: %d vectors",
+                    batch_num,
+                    total_batches,
+                    len(embeddings),
+                )
+                return embeddings
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "OpenAI-compatible embedding batch %d/%d failed "
+                    "(attempt %d/%d, %d texts, %d chars): %s: %s",
+                    batch_num,
+                    total_batches,
+                    attempt,
+                    self.max_retries,
+                    len(batch),
+                    total_chars,
+                    type(exc).__name__,
+                    exc,
+                )
+                if len(batch) > 1 and _is_retryable_embedding_error(exc):
+                    mid = max(1, len(batch) // 2)
+                    logger.warning(
+                        "OpenAI-compatible embedding batch %d/%d shrinking from %d to %d+%d texts",
+                        batch_num,
+                        total_batches,
+                        len(batch),
+                        mid,
+                        len(batch) - mid,
+                    )
+                    left = self._embed_batch(batch[:mid], task_type, batch_num, total_batches)
+                    right = self._embed_batch(batch[mid:], task_type, batch_num, total_batches)
+                    return left + right
+                if attempt < self.max_retries:
+                    time.sleep(2 ** attempt)
+
+        raise EmbeddingError(
+            f"OpenAI-compatible embedding batch {batch_num}/{total_batches} "
+            f"failed after {self.max_retries} attempts "
+            f"({len(batch)} texts, {total_chars} chars): "
+            f"{type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc}"
+        )
+
+    def embed(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+        if not texts:
+            return []
+        results = []
+        batch_size = self.batch_size
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            results.extend(self._embed_batch(batch, task_type, i // batch_size + 1, total_batches))
+        return results
+
+    def embed_query(self, query: str) -> list[float]:
+        return self.embed([query], task_type="RETRIEVAL_QUERY")[0]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.embed(texts, task_type="RETRIEVAL_DOCUMENT")
+
+
+def _is_retryable_embedding_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {429, 500, 502, 503, 504}:
+        return True
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        response_status = getattr(response, "status_code", None)
+        if response_status in {429, 500, 502, 503, 504}:
+            return True
+
+    body = str(exc).lower()
+    return any(
+        marker in body
+        for marker in (
+            "cuda out of memory",
+            "cuda_oom",
+            "out of memory",
+            "embedding request exhausted cuda memory",
+            "server error",
+        )
+    )
+
+
 def create_embedder(config: "Config"):
     """Create embedder based on config.embedding_provider.
 
@@ -217,8 +354,30 @@ def create_embedder(config: "Config"):
             timeout=config.embedding_timeout,
             max_retries=config.embedding_max_retries,
         )
+    elif config.embedding_provider == "openai_compatible":
+        logger.info(
+            "Using OpenAI-compatible embeddings (%s, %d dimensions, %s)",
+            config.embedding_model,
+            config.embedding_dimensions,
+            config.embedding_base_url,
+        )
+        if not config.embedding_base_url or not config.embedding_api_key:
+            raise ValueError(
+                "embedding_base_url and embedding_api_key are required for "
+                "embedding_provider='openai_compatible'"
+            )
+        return OpenAICompatibleEmbedder(
+            model=config.embedding_model,
+            base_url=config.embedding_base_url,
+            api_key=config.embedding_api_key,
+            dimensions=config.embedding_dimensions,
+            query_instruction=config.embedding_query_instruction,
+            batch_size=config.embedding_batch_size,
+            timeout=config.embedding_timeout,
+            max_retries=config.embedding_max_retries,
+        )
     else:
         raise ValueError(
             f"Invalid embedding_provider: {config.embedding_provider}. "
-            f"Must be 'gemini' or 'local'"
+            "Must be 'gemini', 'local', or 'openai_compatible'"
         )

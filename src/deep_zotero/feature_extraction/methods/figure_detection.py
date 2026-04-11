@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import pymupdf
 
+from ..._numbering import parse_numeric_identifier
 from ..captions import DetectedCaption
 
 if TYPE_CHECKING:
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 _MERGE_GAP_PTS = 50  # merge boxes within 50 pts (bridges multi-panel figure gaps)
 _DEFAULT_DPI = 150
-_CAPTION_NUM_RE = re.compile(r"(\d+)")
+_CAPTION_NUM_RE = re.compile(r"(?:Figure|Fig\.?)\s+(\d+|[IVXLCDM]+)", re.IGNORECASE)
 
 
 def _min_figure_area(page_rect: pymupdf.Rect) -> float:
@@ -225,10 +226,8 @@ def _match_by_proximity(
     if numbered:
         def num_sort_key(item: tuple[str, int, str]) -> tuple[int, int | str]:
             num_str = item[0]
-            try:
-                return (0, int(num_str))
-            except ValueError:
-                return (1, num_str)
+            parsed = parse_numeric_identifier(num_str)
+            return (0, parsed) if parsed is not None else (1, num_str)
 
         numbered.sort(key=num_sort_key)
 

@@ -36,6 +36,14 @@ class Config:
     vision_enabled: bool
     vision_model: str
     anthropic_api_key: str | None
+    # OpenAI-compatible embedding endpoint settings
+    embedding_base_url: str | None = None
+    embedding_api_key: str | None = None
+    embedding_query_instruction: str | None = None
+    embedding_batch_size: int = 8
+    embedding_auto_start: bool = False
+    embedding_startup_timeout: float = 180.0
+    embedding_start_command: str | None = None
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> "Config":
@@ -79,6 +87,14 @@ class Config:
             vision_enabled=data.get("vision_enabled", True),
             vision_model=data.get("vision_model", "claude-haiku-4-5-20251001"),
             anthropic_api_key=data.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"),
+            # OpenAI-compatible embedding settings
+            embedding_base_url=data.get("embedding_base_url") or os.environ.get("EMBEDDING_BASE_URL"),
+            embedding_api_key=data.get("embedding_api_key") or os.environ.get("EMBEDDING_API_KEY"),
+            embedding_query_instruction=data.get("embedding_query_instruction"),
+            embedding_batch_size=data.get("embedding_batch_size", 8),
+            embedding_auto_start=data.get("embedding_auto_start", False),
+            embedding_startup_timeout=data.get("embedding_startup_timeout", 180.0),
+            embedding_start_command=data.get("embedding_start_command") or os.environ.get("EMBEDDING_START_COMMAND"),
         )
 
     def validate(self) -> list[str]:
@@ -89,10 +105,20 @@ class Config:
         if not (self.zotero_data_dir / "zotero.sqlite").exists():
             errors.append(f"Zotero database not found: {self.zotero_data_dir / 'zotero.sqlite'}")
 
+        valid_providers = ("gemini", "local", "openai_compatible")
+
         # Only require API key for Gemini provider
         if self.embedding_provider == "gemini" and not self.gemini_api_key:
             errors.append("GEMINI_API_KEY not set (required for embedding_provider='gemini')")
-        elif self.embedding_provider not in ("gemini", "local"):
-            errors.append(f"Invalid embedding_provider: {self.embedding_provider}. Must be 'gemini' or 'local'")
+        elif self.embedding_provider == "openai_compatible":
+            if not self.embedding_base_url:
+                errors.append("embedding_base_url not set (required for embedding_provider='openai_compatible')")
+            if not self.embedding_api_key:
+                errors.append("embedding_api_key not set (required for embedding_provider='openai_compatible')")
+        elif self.embedding_provider not in valid_providers:
+            errors.append(
+                f"Invalid embedding_provider: {self.embedding_provider}. "
+                "Must be 'gemini', 'local', or 'openai_compatible'"
+            )
 
         return errors

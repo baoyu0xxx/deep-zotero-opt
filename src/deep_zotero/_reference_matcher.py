@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 from bisect import bisect_right
+from ._numbering import parse_numeric_identifier
 from .models import Chunk, ExtractedTable, ExtractedFigure
 
 
@@ -27,19 +28,23 @@ def match_references(
     chunk_starts = [c.char_start for c in chunks]
 
     # Scan full_markdown for all "Table N", "Fig. N", "Figure N" references
-    table_ref_re = re.compile(r"(?:Table|Tab\.?)\s+(\d+)", re.IGNORECASE)
-    fig_ref_re = re.compile(r"(?:Figure|Fig\.?)\s+(\d+)", re.IGNORECASE)
+    table_ref_re = re.compile(r"(?:Table|Tab\.?)\s+(\d+|[IVXLCDM]+)", re.IGNORECASE)
+    fig_ref_re = re.compile(r"(?:Figure|Fig\.?)\s+(\d+|[IVXLCDM]+)", re.IGNORECASE)
 
     # Find first occurrence char offset for each reference
     first_table_ref: dict[int, int] = {}  # caption_num -> char_offset
     for m in table_ref_re.finditer(full_markdown):
-        num = int(m.group(1))
+        num = parse_numeric_identifier(m.group(1))
+        if num is None:
+            continue
         if num not in first_table_ref:
             first_table_ref[num] = m.start()
 
     first_fig_ref: dict[int, int] = {}
     for m in fig_ref_re.finditer(full_markdown):
-        num = int(m.group(1))
+        num = parse_numeric_identifier(m.group(1))
+        if num is None:
+            continue
         if num not in first_fig_ref:
             first_fig_ref[num] = m.start()
 
@@ -102,5 +107,9 @@ def _parse_caption_num(caption: str | None) -> int | None:
     """Extract the first integer from a caption string."""
     if not caption:
         return None
-    m = re.search(r"(\d+)", caption)
-    return int(m.group(1)) if m else None
+    m = re.search(
+        r"(?:Figure|Fig\.?|Table|Tab\.?)\s+(\d+|[IVXLCDM]+)",
+        caption,
+        re.IGNORECASE,
+    )
+    return parse_numeric_identifier(m.group(1)) if m else None

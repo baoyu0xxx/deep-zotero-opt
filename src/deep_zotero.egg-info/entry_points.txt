@@ -1,3 +1,0 @@
-[console_scripts]
-deep-zotero = deep_zotero.server:mcp.run
-deep-zotero-index = deep_zotero.cli:main

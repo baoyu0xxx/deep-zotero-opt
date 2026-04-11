@@ -1,10 +1,20 @@
 """CLI entry point for indexing Zotero libraries."""
 import argparse
 import logging
+import os
 import sys
+from pathlib import Path
 
 from .config import Config
 from .indexer import Indexer
+
+
+def _configure_temp_dir(temp_dir: str | None, config: Config) -> None:
+    """Point Python/native temporary files at a caller-controlled directory."""
+    root = Path(temp_dir).expanduser() if temp_dir else config.chroma_db_path.parent / "tmp"
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[name] = str(root)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,6 +43,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable vision-based table extraction even if configured",
     )
     parser.add_argument(
+        "--ocr-mode",
+        choices=("auto", "always", "off"),
+        default="auto",
+        help=(
+            "OCR mode for PDF extraction: auto runs OCR only when needed, "
+            "always forces OCR, off disables OCR"
+        ),
+    )
+    parser.add_argument(
+        "--temp-dir", type=str, default=None,
+        help=(
+            "Directory for Python/native temporary files "
+            "(default: <chroma_db_parent>/tmp)"
+        ),
+    )
+    parser.add_argument(
         "--config", type=str, default=None,
         help="Path to config JSON file (default: ~/.config/deep-zotero/config.json)",
     )
@@ -58,12 +84,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_vision:
         config.vision_enabled = False
 
+    _configure_temp_dir(args.temp_dir, config)
+
     indexer = Indexer(config)
     result = indexer.index_all(
         force_reindex=args.force,
         limit=args.limit,
         item_key=args.item_key,
         title_pattern=args.title,
+        ocr_mode=args.ocr_mode,
     )
 
     # Print summary

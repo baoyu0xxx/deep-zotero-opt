@@ -6,6 +6,8 @@ ML-based layout detection (tables, figures, headers, footers, OCR).
 from __future__ import annotations
 
 import logging
+import contextlib
+import io
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -16,6 +18,14 @@ import pymupdf.layout  # noqa: F401 — activates layout engine, MUST be before 
 import pymupdf4llm
 import pymupdf
 
+try:
+    # MuPDF can print repair/structure diagnostics directly to stderr for
+    # malformed-but-readable PDFs. Real PyMuPDF exceptions still propagate.
+    pymupdf.TOOLS.mupdf_display_errors(False)
+    pymupdf.TOOLS.mupdf_display_warnings(False)
+except Exception:
+    pass
+
 from .models import (
     PageExtraction,
     DocumentExtraction,
@@ -25,6 +35,7 @@ from .models import (
     CONFIDENCE_SCHEME_MATCH,
     CONFIDENCE_GAP_FILL,
 )
+from ._numbering import parse_numeric_identifier
 from .section_classifier import categorize_heading
 from .feature_extraction.vision_extract import compute_all_crops, compute_recrop_bbox
 from .feature_extraction.postprocessors.cell_cleaning import clean_cells
@@ -38,6 +49,12 @@ logger = logging.getLogger(__name__)
 
 # Pattern for filtering page identifiers from section-header boxes (e.g. "R1356")
 _PAGE_ID_RE = re.compile(r"^R?\d+$")
+_BENIGN_THIRD_PARTY_OUTPUT = (
+    "MuPDF error: format error: No common ancestor in structure tree",
+    "MuPDF error: syntax error: unknown cid font type",
+)
+_RAPIDOCR_CUDA_CONFIGURED = False
+_NVIDIA_DLL_DIRECTORY_HANDLES = []
 
 from .feature_extraction.captions import (
     _TABLE_CAPTION_RE,
@@ -203,6 +220,8 @@ def _classify_artifact(table: "ExtractedTable") -> str | None:
     if not has_real_caption:
         if _FIG_REF_IN_CELL_RE.search(all_text):
             return "diagram_as_table"
+        if re.search(r"\b(?:Figure|Fig\.?)\s+\d+\b", all_text, re.IGNORECASE):
+            return "diagram_as_table"
 
     return None
 
@@ -237,6 +256,373 @@ def _extract_figures_for_page(
         ))
     return figures
 
+def _configure_rapidocr_cuda() -> None:
+    """Configure pymupdf4llm's RapidOCR adapter to use ONNX Runtime CUDA."""
+    global _RAPIDOCR_CUDA_CONFIGURED
+    if _RAPIDOCR_CUDA_CONFIGURED:
+        return
+
+    try:
+        import onnxruntime as ort
+    except Exception as exc:
+        raise RuntimeError(
+            "GPU OCR requires onnxruntime-gpu, but onnxruntime could not be "
+            f"imported: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    _add_nvidia_dll_directories()
+
+    preload = getattr(ort, "preload_dlls", None)
+    if preload is not None:
+        try:
+            preload(directory="")
+        except TypeError:
+            preload()
+        except Exception as exc:
+            raise RuntimeError(
+                "GPU OCR could not preload CUDA/cuDNN DLLs for onnxruntime-gpu. "
+                "Reinstall a CUDA-compatible onnxruntime-gpu stack and try "
+                f"again: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    providers = ort.get_available_providers()
+    if "CUDAExecutionProvider" not in providers:
+        raise RuntimeError(
+            "GPU OCR requires ONNX Runtime CUDAExecutionProvider, but available "
+            f"providers are {providers}. Uninstall CPU onnxruntime and install "
+            "onnxruntime-gpu[cuda,cudnn]."
+        )
+
+    _assert_onnxruntime_cuda_provider_loads(ort)
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        from pymupdf4llm.ocr import rapidocr_api
+    except Exception as exc:
+        raise RuntimeError(
+            "GPU OCR requires rapidocr_onnxruntime and pymupdf4llm's RapidOCR "
+            f"adapter: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    rapidocr_api.ENGINE = RapidOCR(
+        det_use_cuda=True,
+        cls_use_cuda=True,
+        rec_use_cuda=True,
+    )
+    _assert_rapidocr_engine_uses_cuda(rapidocr_api.ENGINE)
+    _RAPIDOCR_CUDA_CONFIGURED = True
+
+
+def _add_nvidia_dll_directories() -> None:
+    """Register NVIDIA wheel DLL folders for Windows Python 3.8+ loading."""
+    import os
+    import site
+    import sys
+
+    if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
+        return
+
+    path_entries: list[str] = []
+    for site_dir in site.getsitepackages():
+        nvidia_dir = Path(site_dir) / "nvidia"
+        if not nvidia_dir.exists():
+            continue
+        for bin_dir in nvidia_dir.glob("**/bin"):
+            if bin_dir.is_dir():
+                bin_dir_str = str(bin_dir)
+                _NVIDIA_DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(bin_dir_str))
+                path_entries.append(bin_dir_str)
+    if path_entries:
+        os.environ["PATH"] = ";".join(path_entries + [os.environ.get("PATH", "")])
+
+
+def _assert_onnxruntime_cuda_provider_loads(ort) -> None:
+    """Fail fast when CUDAExecutionProvider is listed but its DLL cannot load."""
+    import ctypes
+    import sys
+
+    ort_file = getattr(ort, "__file__", None)
+    if not ort_file:
+        return
+
+    if sys.platform == "win32":
+        provider_name = "onnxruntime_providers_cuda.dll"
+        load_library = ctypes.WinDLL
+    elif sys.platform == "darwin":
+        provider_name = "libonnxruntime_providers_cuda.dylib"
+        load_library = ctypes.CDLL
+    else:
+        provider_name = "libonnxruntime_providers_cuda.so"
+        load_library = ctypes.CDLL
+
+    ort_root = Path(ort_file).resolve().parent
+    candidates = (ort_root / "capi" / provider_name, ort_root / provider_name)
+    provider_path = next((path for path in candidates if path.exists()), None)
+    if provider_path is None:
+        raise RuntimeError(
+            "GPU OCR could not find ONNX Runtime's CUDA provider library "
+            f"{provider_name}. Reinstall onnxruntime-gpu."
+        )
+
+    try:
+        load_library(str(provider_path))
+    except OSError as exc:
+        raise RuntimeError(
+            "GPU OCR found CUDAExecutionProvider, but ONNX Runtime's CUDA "
+            f"provider library could not be loaded from {provider_path}. Install "
+            "matching CUDA/cuDNN DLLs, for example onnxruntime-gpu[cuda,cudnn]. "
+            f"Original error: {exc}"
+        ) from exc
+
+
+def _assert_rapidocr_engine_uses_cuda(engine) -> None:
+    """Fail if RapidOCR created CPU-backed ONNX Runtime sessions."""
+    session_candidates = (
+        ("det", getattr(getattr(engine, "text_det", None), "infer", None)),
+        ("cls", getattr(getattr(engine, "text_cls", None), "infer", None)),
+        ("rec", getattr(getattr(engine, "text_rec", None), "session", None)),
+    )
+    checked = 0
+    for name, wrapper in session_candidates:
+        session = getattr(wrapper, "session", None)
+        get_providers = getattr(session, "get_providers", None)
+        if not callable(get_providers):
+            continue
+        checked += 1
+        providers = get_providers()
+        if not providers or providers[0] != "CUDAExecutionProvider":
+            raise RuntimeError(
+                f"GPU OCR requires RapidOCR {name} inference to run on "
+                f"CUDAExecutionProvider, but its providers are {providers}."
+            )
+    if checked:
+        logger.info("RapidOCR CUDA sessions initialized: %s", checked)
+
+
+def _safe_rapidocr(
+    page,
+    dpi=300,
+    pixmap=None,
+    language: str = "eng",
+    keep_ocr_text: bool = False,
+):
+    """Run RapidOCR through CUDA and fail clearly if GPU OCR is unavailable."""
+    _configure_rapidocr_cuda()
+    from pymupdf4llm.ocr import rapidocr_api
+
+    try:
+        return rapidocr_api.exec_ocr(
+            page,
+            dpi=dpi,
+            pixmap=pixmap,
+            language=language,
+            keep_ocr_text=keep_ocr_text,
+        )
+    except TypeError as exc:
+        if "NoneType" in str(exc):
+            logger.warning("RapidOCR returned no text for page %s", page.number + 1)
+            return None
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"GPU RapidOCR failed on page {page.number + 1}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _should_enable_ocr(
+    pdf_path: Path,
+    *,
+    ocr_mode: str,
+    min_native_chars: int = 20,
+    min_scan_ratio: float = 0.2,
+) -> tuple[bool, dict[str, int]]:
+    """Decide whether OCR should be wired into pymupdf4llm for this document."""
+    if ocr_mode == "off":
+        return False, {"total_pages": 0, "native_text_pages": 0, "scan_pages": 0}
+    if ocr_mode == "always":
+        return True, {"total_pages": 0, "native_text_pages": 0, "scan_pages": 0}
+    if ocr_mode != "auto":
+        raise ValueError("ocr_mode must be one of: auto, always, off")
+
+    doc = pymupdf.open(str(pdf_path))
+    try:
+        total_pages = len(doc)
+        native_text_pages = sum(
+            1 for page in doc if len(page.get_text().strip()) >= min_native_chars
+        )
+    finally:
+        doc.close()
+
+    scan_pages = max(0, total_pages - native_text_pages)
+    if total_pages == 0:
+        return False, {"total_pages": 0, "native_text_pages": 0, "scan_pages": 0}
+    return (scan_pages / total_pages) >= min_scan_ratio, {
+        "total_pages": total_pages,
+        "native_text_pages": native_text_pages,
+        "scan_pages": scan_pages,
+    }
+
+
+def _log_captured_output(pdf_name: str, captured: str) -> None:
+    messages = [line.strip() for line in captured.splitlines() if line.strip()]
+    messages = [
+        line
+        for line in messages
+        if not any(benign in line for benign in _BENIGN_THIRD_PARTY_OUTPUT)
+    ]
+    if messages:
+        logger.debug("Captured third-party extraction output for %s: %s", pdf_name, messages[:5])
+
+
+def _to_markdown_quiet(pdf_path: Path, kwargs: dict) -> list[dict]:
+    """Run pymupdf4llm while capturing direct stdout/stderr writes."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    pymupdf_messages: list[str] = []
+    original_message = getattr(pymupdf, "message", None)
+
+    def capture_pymupdf_message(*args, **_kwargs):
+        pymupdf_messages.append(" ".join(str(arg) for arg in args))
+
+    if original_message is not None:
+        pymupdf.message = capture_pymupdf_message
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            page_chunks = pymupdf4llm.to_markdown(str(pdf_path), **kwargs)
+    finally:
+        if original_message is not None:
+            pymupdf.message = original_message
+    _log_captured_output(
+        pdf_path.name,
+        stdout.getvalue() + stderr.getvalue() + "\n".join(pymupdf_messages),
+    )
+    return page_chunks
+
+
+def _safe_page_number(raw_page_num: object, fallback: int, *, context: str) -> int:
+    parsed = parse_numeric_identifier(raw_page_num)
+    if parsed is None or parsed < 1:
+        logger.warning(
+            "Invalid page identifier %r in %s; falling back to sequential page %d",
+            raw_page_num,
+            context,
+            fallback,
+        )
+        return fallback
+    return parsed
+
+
+def _parse_markdown_table(table_md: str) -> tuple[list[str], list[list[str]]]:
+    """Parse a simple pipe markdown table from pymupdf4llm layout output."""
+    parsed_rows: list[list[str]] = []
+    for line in table_md.splitlines():
+        line = line.strip()
+        if not line.startswith("|") or "|" not in line[1:]:
+            continue
+        cells = [cell.strip().replace("<br>", " ") for cell in line.strip("|").split("|")]
+        if cells and all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells):
+            continue
+        cells = [re.sub(r"\*\*(.*?)\*\*", r"\1", cell).strip() for cell in cells]
+        parsed_rows.append(cells)
+
+    if not parsed_rows:
+        return [], []
+    return clean_cells(parsed_rows[0], parsed_rows[1:])
+
+
+def _nearest_table_caption(
+    table_bbox: tuple[float, float, float, float],
+    captions: list,
+    used: set[int],
+):
+    table_rect = pymupdf.Rect(table_bbox)
+    best_idx = None
+    best_score = float("inf")
+    best_position = ""
+    available = [
+        (idx, cap)
+        for idx, cap in enumerate(captions)
+        if idx not in used and cap.caption_type == "table"
+    ]
+    above = [(idx, cap) for idx, cap in available if cap.y_center <= table_rect.y0]
+    candidates = above or available
+    for idx, cap in candidates:
+        cap_rect = pymupdf.Rect(cap.bbox)
+        if cap.y_center <= table_rect.y0:
+            vertical_gap = abs(cap_rect.y1 - table_rect.y0)
+            position = "above"
+        else:
+            vertical_gap = abs(table_rect.y1 - cap_rect.y0)
+            position = "below"
+        horizontal_gap = max(0.0, table_rect.x0 - cap_rect.x1, cap_rect.x0 - table_rect.x1)
+        score = vertical_gap + horizontal_gap * 0.25
+        if score < best_score:
+            best_idx = idx
+            best_score = score
+            best_position = position
+    if best_idx is None:
+        return None, ""
+    used.add(best_idx)
+    return captions[best_idx], best_position
+
+
+def _extract_layout_tables(
+    doc: pymupdf.Document,
+    page_chunks: list[dict],
+) -> list[ExtractedTable]:
+    """Build ExtractedTable objects from pymupdf4llm layout table boxes."""
+    tables: list[ExtractedTable] = []
+    table_idx_per_page: dict[int, int] = defaultdict(int)
+    captions_by_page: dict[int, list] = {}
+    used_captions_by_page: dict[int, set[int]] = defaultdict(set)
+
+    for chunk_idx, chunk in enumerate(page_chunks, 1):
+        pnum = _safe_page_number(
+            chunk.get("metadata", {}).get("page_number", chunk_idx),
+            chunk_idx,
+            context="_extract_layout_tables",
+        )
+        if pnum < 1 or pnum > len(doc):
+            continue
+        text = chunk.get("text", "")
+        page = doc[pnum - 1]
+        captions = captions_by_page.setdefault(
+            pnum,
+            find_all_captions(page, include_figures=False, include_tables=True),
+        )
+
+        for box in chunk.get("page_boxes", []):
+            if box.get("class") != "table":
+                continue
+            pos = box.get("pos")
+            if not (pos and isinstance(pos, (list, tuple)) and len(pos) == 2):
+                continue
+            headers, rows = _parse_markdown_table(text[pos[0]:pos[1]])
+            if not headers and not rows:
+                continue
+            bbox = tuple(box.get("bbox", (0.0, 0.0, 0.0, 0.0)))
+            caption, caption_position = _nearest_table_caption(
+                bbox,
+                captions,
+                used_captions_by_page[pnum],
+            )
+            table_index = table_idx_per_page[pnum]
+            table_idx_per_page[pnum] += 1
+            table = ExtractedTable(
+                page_num=pnum,
+                table_index=table_index,
+                bbox=bbox,
+                headers=headers,
+                rows=rows,
+                caption=caption.text if caption else None,
+                caption_position=caption_position,
+                extraction_strategy="pymupdf4llm-layout",
+            )
+            table.artifact_type = _classify_artifact(table)
+            tables.append(table)
+
+    return [table for table in tables if not table.artifact_type]
 
 
 def extract_document(
@@ -245,10 +631,21 @@ def extract_document(
     write_images: bool = False,
     images_dir: Path | str | None = None,
     ocr_language: str = "eng",
+    ocr_mode: str = "auto",
     vision_api: "VisionAPI | None" = None,
 ) -> DocumentExtraction:
     """Extract a PDF document using pymupdf4llm with layout detection."""
     pdf_path = Path(pdf_path)
+    use_ocr, ocr_probe = _should_enable_ocr(pdf_path, ocr_mode=ocr_mode)
+    logger.info(
+        "OCR mode for %s: %s (requested=%s, native_text_pages=%s/%s, scan_pages=%s)",
+        pdf_path.name,
+        "enabled" if use_ocr else "disabled",
+        ocr_mode,
+        ocr_probe["native_text_pages"],
+        ocr_probe["total_pages"],
+        ocr_probe.get("scan_pages", 0),
+    )
 
     kwargs: dict = dict(
         page_chunks=True,
@@ -257,17 +654,33 @@ def extract_document(
         footer=False,
         show_progress=False,
     )
+    if use_ocr:
+        from pymupdf4llm.ocr import OCRMode
 
-    page_chunks: list[dict] = pymupdf4llm.to_markdown(str(pdf_path), **kwargs)
+        kwargs["use_ocr"] = (
+            OCRMode.ALWAYS_REMOVING_OLD
+            if ocr_mode == "always"
+            else OCRMode.SELECT_REMOVING_OLD
+        )
+        kwargs["ocr_function"] = _safe_rapidocr
+        kwargs["ocr_language"] = ocr_language
+    else:
+        kwargs["use_ocr"] = False
+
+    page_chunks: list[dict] = _to_markdown_quiet(pdf_path, kwargs)
 
     # Build pages and full markdown
     pages: list[PageExtraction] = []
     md_parts: list[str] = []
     char_offset = 0
 
-    for chunk in page_chunks:
+    for chunk_idx, chunk in enumerate(page_chunks, 1):
         md = chunk.get("text", "")
-        page_num = chunk.get("metadata", {}).get("page_number", 1)
+        page_num = _safe_page_number(
+            chunk.get("metadata", {}).get("page_number", chunk_idx),
+            chunk_idx,
+            context="page_chunks",
+        )
         page_boxes = chunk.get("page_boxes", [])
         tables_on_page = sum(1 for b in page_boxes if b.get("class") == "table")
         images_on_page = sum(1 for b in page_boxes if b.get("class") == "picture")
@@ -310,8 +723,12 @@ def extract_document(
     # Each entry: (page_num, page, detected_caption, crop_bbox)
     _table_crops: list[tuple[int, "pymupdf.Page", object, tuple]] = []
 
-    for chunk in page_chunks:
-        pnum = chunk.get("metadata", {}).get("page_number", 1)
+    for chunk_idx, chunk in enumerate(page_chunks, 1):
+        pnum = _safe_page_number(
+            chunk.get("metadata", {}).get("page_number", chunk_idx),
+            chunk_idx,
+            context="extract_document",
+        )
         page = doc[pnum - 1]
 
         page_label = None
@@ -365,6 +782,8 @@ def extract_document(
                 crop_bbox=crop_bbox,
             ))
         pending = PendingVisionWork(specs=specs, crop_infos=crop_infos, pdf_path=pdf_path)
+    elif vision_api is None:
+        tables = _extract_layout_tables(doc, page_chunks)
 
     # --- Figure post-processing (independent of tables) ---
     for f in figures:
@@ -589,7 +1008,9 @@ def resolve_pending_vision(
             continue
         need_followup: list[tuple[int, object]] = []
         for local_idx, rc_resp in recrop_dict.items():
-            if rc_resp.parse_success and not rc_resp.is_incomplete and (rc_resp.headers or rc_resp.rows):
+            if rc_resp.parse_success:
+                continue
+            if rc_resp.headers or rc_resp.rows:
                 continue
             need_followup.append((local_idx, rc_resp))
 
@@ -858,8 +1279,12 @@ def _sections_from_toc(
 
     # Build page-indexed section-header box lookup
     header_boxes_by_page: dict[int, list[dict]] = {}
-    for chunk in page_chunks:
-        page_num = chunk.get("metadata", {}).get("page_number", 1)
+    for chunk_idx, chunk in enumerate(page_chunks, 1):
+        page_num = _safe_page_number(
+            chunk.get("metadata", {}).get("page_number", chunk_idx),
+            chunk_idx,
+            context="_sections_from_toc",
+        )
         text = chunk.get("text", "")
         for box in chunk.get("page_boxes", []):
             if box.get("class") == "section-header":
@@ -877,7 +1302,8 @@ def _sections_from_toc(
     matched: list[tuple[int, int, str, str]] = []  # (global_offset, level, toc_title, heading_text)
 
     for entry in toc_entries:
-        level, title, page = entry[0], entry[1], entry[2]
+        level, title = entry[0], entry[1]
+        page = _safe_page_number(entry[2], 1, context=f"toc entry {title!r}")
         if level > 3:
             continue
         # For level-3+, only include if the heading has a high-value keyword match
@@ -983,8 +1409,12 @@ def _sections_from_header_boxes(
 
     headers: list[tuple[int, str]] = []  # (global_offset, heading_text)
 
-    for chunk in page_chunks:
-        page_num = chunk.get("metadata", {}).get("page_number", 1)
+    for chunk_idx, chunk in enumerate(page_chunks, 1):
+        page_num = _safe_page_number(
+            chunk.get("metadata", {}).get("page_number", chunk_idx),
+            chunk_idx,
+            context="_sections_from_header_boxes",
+        )
         text = chunk.get("text", "")
         page_obj = None
         for p in pages:
@@ -1616,10 +2046,9 @@ def _compute_completeness(
     def _find_gaps(nums: set[str]) -> list[str]:
         int_nums = set()
         for n in nums:
-            try:
-                int_nums.add(int(n))
-            except ValueError:
-                pass  # skip non-integer like "A.1", "S1"
+            parsed = parse_numeric_identifier(n)
+            if parsed is not None:
+                int_nums.add(parsed)
         if not int_nums:
             return []
         full_range = set(range(1, max(int_nums) + 1))

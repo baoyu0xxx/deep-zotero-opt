@@ -1,12 +1,69 @@
 """Unit tests for pdf_processor module."""
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from deep_zotero.feature_extraction.vision_extract import AgentResponse
+
+
+def test_configure_rapidocr_cuda_requires_cuda_provider(monkeypatch):
+    from deep_zotero import pdf_processor
+
+    fake_ort = types.SimpleNamespace(
+        preload_dlls=lambda **_kwargs: None,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setattr(pdf_processor, "_RAPIDOCR_CUDA_CONFIGURED", False)
+
+    with pytest.raises(RuntimeError, match="CUDAExecutionProvider"):
+        pdf_processor._configure_rapidocr_cuda()
+
+
+def test_configure_rapidocr_cuda_rebuilds_engine_with_cuda(monkeypatch):
+    from deep_zotero import pdf_processor
+
+    calls = {"preload": 0, "rapidocr_kwargs": None}
+
+    def preload_dlls(**_kwargs):
+        calls["preload"] += 1
+
+    fake_ort = types.SimpleNamespace(
+        preload_dlls=preload_dlls,
+        get_available_providers=lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    class FakeRapidOCR:
+        def __init__(self, **kwargs):
+            calls["rapidocr_kwargs"] = kwargs
+
+    fake_rapidocr_pkg = types.ModuleType("rapidocr_onnxruntime")
+    fake_rapidocr_pkg.RapidOCR = FakeRapidOCR
+    fake_ocr_pkg = types.ModuleType("pymupdf4llm.ocr")
+    fake_rapidocr_api = types.ModuleType("pymupdf4llm.ocr.rapidocr_api")
+    fake_rapidocr_api.ENGINE = object()
+    fake_ocr_pkg.rapidocr_api = fake_rapidocr_api
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", fake_rapidocr_pkg)
+    monkeypatch.setitem(sys.modules, "pymupdf4llm.ocr", fake_ocr_pkg)
+    monkeypatch.setitem(sys.modules, "pymupdf4llm.ocr.rapidocr_api", fake_rapidocr_api)
+    monkeypatch.setattr(pdf_processor, "_RAPIDOCR_CUDA_CONFIGURED", False)
+
+    pdf_processor._configure_rapidocr_cuda()
+
+    assert calls["preload"] == 1
+    assert calls["rapidocr_kwargs"] == {
+        "det_use_cuda": True,
+        "cls_use_cuda": True,
+        "rec_use_cuda": True,
+    }
+    assert isinstance(fake_rapidocr_api.ENGINE, FakeRapidOCR)
 
 
 def test_layout_import_order():

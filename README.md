@@ -1,6 +1,12 @@
 # DeepZotero
 
-Semantic search over a Zotero library. PDFs are extracted (text, tables, figures), chunked, embedded, and stored in ChromaDB. An MCP server exposes the index to Claude Code (or any MCP client) as 13 tools for semantic search, boolean search, table/figure search, context expansion, citation graph lookup, indexing, and cost tracking.
+Semantic search over a Zotero library. PDFs are extracted (text, tables, figures), chunked, embedded, and stored in ChromaDB. An MCP server exposes the index to Claude Code (or any MCP client) as 14 tools for semantic search, boolean search, table/figure search, context expansion, citation graph lookup, indexing, and cost tracking.
+
+## Workspace Guidance
+
+- Open Codex at `D:\pyproject`. That is the trusted workspace root.
+- `zotero_rag&mcp` is a helper/wrapper workspace only.
+- `deep-zotero` remains the canonical MCP entrypoint and is the repo referenced by the server config.
 
 ## What it extracts
 
@@ -89,10 +95,12 @@ CLI options:
 | `--item-key KEY` | Index a single Zotero item |
 | `--title PATTERN` | Regex filter on title (case-insensitive) |
 | `--no-vision` | Skip vision table extraction for this run |
+| `--ocr-mode auto\|always\|off` | Control OCR for this run; `always` requires GPU OCR to be available |
+| `--temp-dir PATH` | Put Python/native temporary files under a specific directory |
 | `--config PATH` | Use a different config file |
 | `-v` | Debug logging |
 
-The indexer is incremental — it only processes items not already in the index. Use `--force` after changing `chunk_size`, `embedding_dimensions`, or `ocr_language`.
+The indexer is incremental — it only processes items not already in the index. Use `--force` after changing `chunk_size`, `embedding_dimensions`, `ocr_language`, or OCR mode.
 
 You can also trigger indexing from the MCP client via the `index_library` tool.
 
@@ -124,7 +132,7 @@ On Windows:
 }
 ```
 
-Restart Claude Code. All 13 tools will be available.
+Restart Claude Code. All 14 tools will be available.
 
 ---
 
@@ -209,6 +217,10 @@ Parameters: `query`, `top_k` (1-30), `year_min`, `year_max`, `author`, `tag`, `c
 
 Parameters: `query`, `top_k` (1-30), `year_min`, `year_max`, `author`, `tag`, `collection`.
 
+**`search_diverse_papers`** - Diversified paper-level semantic search. Returns distinct papers plus up to a few non-overlapping top passages per paper, so one dominant document does not crowd out the rest of the result set.
+
+Parameters: `query`, `num_papers` (1-50), `passages_per_paper` (1-5), `context_chunks` (0-3), `year_min`, `year_max`, `author`, `tag`, `collection`, `chunk_types`, `section_weights`, `journal_weights`, `required_terms`.
+
 ### Boolean search
 
 **`search_boolean`** — Exact word matching via Zotero's native full-text index. Returns papers (not passages) matching AND/OR word queries. No phrase search, no stemming.
@@ -233,7 +245,7 @@ Requires the document to have a DOI in Zotero.
 
 ### Index management
 
-**`index_library`** — Trigger indexing from the MCP client. Parameters: `force_reindex`, `limit`, `item_key`, `title_pattern`, `no_vision`.
+**`index_library`** — Trigger indexing from the MCP client. Parameters: `force_reindex`, `limit`, `item_key`, `title_pattern`, `no_vision`, `ocr_mode`.
 
 **`get_index_stats`** — Document/chunk/table/figure counts, section coverage, journal coverage.
 

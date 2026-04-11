@@ -81,23 +81,52 @@ class VectorStore:
         )
         self.embedder = embedder
 
-    def add_chunks(self, doc_id: str, doc_meta: dict, chunks: list[Chunk]) -> None:
-        """
-        Add all chunks for a document.
+    @staticmethod
+    def _validate_precomputed_embeddings(
+        documents: list[str], embeddings: list[list[float]] | None
+    ) -> list[list[float]]:
+        if embeddings is None:
+            raise ValueError("precomputed embeddings are required")
+        if len(documents) != len(embeddings):
+            raise ValueError(
+                f"embedding count mismatch: {len(documents)} documents vs "
+                f"{len(embeddings)} embeddings"
+            )
+        return embeddings
 
-        Args:
-            doc_id: Unique document identifier (Zotero item key)
-            doc_meta: Document metadata (title, authors, year)
-            chunks: List of Chunk objects to store
-        """
-        if not chunks:
+    def add_precomputed_records(self, records: dict | None) -> None:
+        """Insert precomputed records into ChromaDB without embedding again."""
+        if not records:
             return
+        ids = records.get("ids") or []
+        documents = records.get("documents") or []
+        embeddings = records.get("embeddings") or []
+        metadatas = records.get("metadatas") or []
+        if not ids:
+            return
+        self.collection.add(
+            ids=ids,
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+
+    def create_chunk_records(
+        self,
+        doc_id: str,
+        doc_meta: dict,
+        chunks: list[Chunk],
+        embeddings: list[list[float]] | None = None,
+    ) -> dict | None:
+        """Build text-chunk records for collection.add() and cache payloads."""
+        if not chunks:
+            return None
 
         ids = [f"{doc_id}_chunk_{c.chunk_index:04d}" for c in chunks]
         texts = [c.text for c in chunks]
-
-        # Use RETRIEVAL_DOCUMENT task type
-        embeddings = self.embedder.embed(texts, task_type="RETRIEVAL_DOCUMENT")
+        if embeddings is None:
+            embeddings = self.embedder.embed(texts, task_type="RETRIEVAL_DOCUMENT")
+        embeddings = self._validate_precomputed_embeddings(texts, embeddings)
 
         metadatas = [
             {
@@ -126,43 +155,56 @@ class VectorStore:
             }
             for c in chunks
         ]
+        return {
+            "ids": ids,
+            "documents": texts,
+            "embeddings": embeddings,
+            "metadatas": metadatas,
+        }
 
-        self.collection.add(
-            ids=ids,
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=metadatas
-        )
+    def add_chunks(self, doc_id: str, doc_meta: dict, chunks: list[Chunk]) -> None:
+        """
+        Add all chunks for a document.
 
-    def add_tables(
+        Args:
+            doc_id: Unique document identifier (Zotero item key)
+            doc_meta: Document metadata (title, authors, year)
+            chunks: List of Chunk objects to store
+        """
+        records = self.create_chunk_records(doc_id, doc_meta, chunks)
+        self.add_precomputed_records(records)
+
+    def add_precomputed_chunks(
+        self,
+        doc_id: str,
+        doc_meta: dict,
+        chunks: list[Chunk],
+        embeddings: list[list[float]],
+    ) -> None:
+        """Add text chunks using caller-provided embeddings."""
+        records = self.create_chunk_records(doc_id, doc_meta, chunks, embeddings=embeddings)
+        self.add_precomputed_records(records)
+
+    def create_table_records(
         self,
         doc_id: str,
         doc_meta: dict,
         tables: list["ExtractedTable"],
         ref_map: dict[tuple[str, int], int] | None = None,
-    ) -> None:
-        """
-        Add table chunks for a document.
-
-        Tables are stored as separate chunks with markdown representation.
-        Chunk IDs use format: {doc_id}_table_{page:04d}_{table_idx:02d}
-
-        Args:
-            doc_id: Unique document identifier (Zotero item key)
-            doc_meta: Document metadata (title, authors, year, etc.)
-            tables: List of ExtractedTable objects to store
-        """
+        embeddings: list[list[float]] | None = None,
+    ) -> dict | None:
+        """Build table records for collection.add() and cache payloads."""
         if not tables:
-            return
+            return None
 
         ids = [
             f"{doc_id}_table_{t.page_num:04d}_{t.table_index:02d}"
             for t in tables
         ]
         texts = [t.to_markdown() for t in tables]
-
-        # Use RETRIEVAL_DOCUMENT task type
-        embeddings = self.embedder.embed(texts, task_type="RETRIEVAL_DOCUMENT")
+        if embeddings is None:
+            embeddings = self.embedder.embed(texts, task_type="RETRIEVAL_DOCUMENT")
+        embeddings = self._validate_precomputed_embeddings(texts, embeddings)
 
         metadatas = [
             {
@@ -194,33 +236,68 @@ class VectorStore:
             }
             for t in tables
         ]
+        return {
+            "ids": ids,
+            "documents": texts,
+            "embeddings": embeddings,
+            "metadatas": metadatas,
+        }
 
-        self.collection.add(
-            ids=ids,
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=metadatas
+    def add_tables(
+        self,
+        doc_id: str,
+        doc_meta: dict,
+        tables: list["ExtractedTable"],
+        ref_map: dict[tuple[str, int], int] | None = None,
+    ) -> None:
+        """
+        Add table chunks for a document.
+
+        Tables are stored as separate chunks with markdown representation.
+        Chunk IDs use format: {doc_id}_table_{page:04d}_{table_idx:02d}
+
+        Args:
+            doc_id: Unique document identifier (Zotero item key)
+            doc_meta: Document metadata (title, authors, year, etc.)
+            tables: List of ExtractedTable objects to store
+        """
+        records = self.create_table_records(
+            doc_id,
+            doc_meta,
+            tables,
+            ref_map=ref_map,
         )
+        self.add_precomputed_records(records)
 
-    def add_figures(
+    def add_precomputed_tables(
+        self,
+        doc_id: str,
+        doc_meta: dict,
+        tables: list["ExtractedTable"],
+        embeddings: list[list[float]],
+        ref_map: dict[tuple[str, int], int] | None = None,
+    ) -> None:
+        """Add tables using caller-provided embeddings."""
+        records = self.create_table_records(
+            doc_id,
+            doc_meta,
+            tables,
+            ref_map=ref_map,
+            embeddings=embeddings,
+        )
+        self.add_precomputed_records(records)
+
+    def create_figure_records(
         self,
         doc_id: str,
         doc_meta: dict,
         figures: list,
         ref_map: dict[tuple[str, int], int] | None = None,
-    ) -> None:
-        """Add figure chunks to the store.
-
-        Figures are stored as separate chunks with caption as text.
-        Chunk IDs use format: {doc_id}_fig_{page:03d}_{fig_idx:02d}
-
-        Args:
-            doc_id: Document ID (Zotero item key)
-            doc_meta: Document-level metadata
-            figures: List of ExtractedFigure objects
-        """
+        embeddings: list[list[float]] | None = None,
+    ) -> dict | None:
+        """Build figure records for collection.add() and cache payloads."""
         if not figures:
-            return
+            return None
 
         ids = []
         documents = []
@@ -263,14 +340,61 @@ class VectorStore:
             documents.append(text)
             metadatas.append(metadata)
 
-        if ids:
+        if not ids:
+            return None
+
+        if embeddings is None:
             embeddings = self.embedder.embed(documents, task_type="RETRIEVAL_DOCUMENT")
-            self.collection.add(
-                ids=ids,
-                documents=documents,
-                embeddings=embeddings,
-                metadatas=metadatas,
-            )
+        embeddings = self._validate_precomputed_embeddings(documents, embeddings)
+        return {
+            "ids": ids,
+            "documents": documents,
+            "embeddings": embeddings,
+            "metadatas": metadatas,
+        }
+
+    def add_figures(
+        self,
+        doc_id: str,
+        doc_meta: dict,
+        figures: list,
+        ref_map: dict[tuple[str, int], int] | None = None,
+    ) -> None:
+        """Add figure chunks to the store.
+
+        Figures are stored as separate chunks with caption as text.
+        Chunk IDs use format: {doc_id}_fig_{page:03d}_{fig_idx:02d}
+
+        Args:
+            doc_id: Document ID (Zotero item key)
+            doc_meta: Document-level metadata
+            figures: List of ExtractedFigure objects
+        """
+        records = self.create_figure_records(
+            doc_id,
+            doc_meta,
+            figures,
+            ref_map=ref_map,
+        )
+        self.add_precomputed_records(records)
+
+    def add_precomputed_figures(
+        self,
+        doc_id: str,
+        doc_meta: dict,
+        figures: list,
+        embeddings: list[list[float]],
+        ref_map: dict[tuple[str, int], int] | None = None,
+    ) -> None:
+        """Add figures using caller-provided embeddings."""
+        records = self.create_figure_records(
+            doc_id,
+            doc_meta,
+            figures,
+            ref_map=ref_map,
+            embeddings=embeddings,
+        )
+        self.add_precomputed_records(records)
 
     def search(
         self,

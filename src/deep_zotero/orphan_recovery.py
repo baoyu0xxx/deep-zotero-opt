@@ -14,12 +14,16 @@ import re
 
 import pymupdf
 
+from ._numbering import parse_numeric_identifier
 from .models import ExtractedFigure, ExtractedTable, SectionSpan, PageExtraction
 
 logger = logging.getLogger(__name__)
 
-# Caption number extraction — matches plain digits or appendix-style (A.1, S1)
-_CAPTION_NUM_RE = re.compile(r"(\d+|[A-Z]\.\d+|S\d+)")
+# Caption number extraction — matches numbers only when attached to a figure/table label.
+_CAPTION_NUM_RE = re.compile(
+    r"(?:Figure|Fig\.?|Table|Tab\.?)\s+(\d+|[IVXLCDM]+|[A-Z]\.\d+|S\d+)",
+    re.IGNORECASE,
+)
 
 # Relaxed caption patterns for gap search (not block-start anchored)
 _NUM_GROUP = r"(\d+|[IVXLCDM]+|[A-Z]\.\d+|S\d+)"
@@ -234,10 +238,9 @@ def _recover_captions(
 
     int_nums: dict[int, int] = {}
     for k, v in assigned_nums.items():
-        try:
-            int_nums[int(k)] = v
-        except ValueError:
-            pass  # skip appendix-style numbers
+        parsed = parse_numeric_identifier(k)
+        if parsed is not None:
+            int_nums[parsed] = v
 
     if not int_nums:
         return recoveries
@@ -334,7 +337,9 @@ def _search_page_text_for_caption(
             if not m:
                 continue
 
-            num = int(m.group(1))
+            num = parse_numeric_identifier(m.group(1))
+            if num is None:
+                continue
             if num != target_num:
                 continue
 

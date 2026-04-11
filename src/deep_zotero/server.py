@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import replace
 from fastmcp import FastMCP
 from .config import Config
-from .embedder import Embedder
+from .embedder import create_embedder
 from .vector_store import VectorStore
 from .retriever import Retriever
 from .reranker import (
@@ -135,13 +135,7 @@ def _get_retriever() -> Retriever:
     global _retriever, _store, _reranker, _config
     if _retriever is None:
         _config = Config.load()
-        embedder = Embedder(
-            model=_config.embedding_model,
-            dimensions=_config.embedding_dimensions,
-            api_key=_config.gemini_api_key,
-            timeout=_config.embedding_timeout,
-            max_retries=_config.embedding_max_retries,
-        )
+        embedder = create_embedder(_config)
         _store = VectorStore(_config.chroma_db_path, embedder)
         _retriever = Retriever(_store)
         _reranker = Reranker(alpha=_config.rerank_alpha)
@@ -326,6 +320,62 @@ def _result_to_dict(r) -> dict:
     }
 
 
+def _validate_search_inputs(
+    chunk_types: list[str] | None = None,
+    section_weights: dict[str, float] | None = None,
+    journal_weights: dict[str, float] | None = None,
+) -> None:
+    """Validate common semantic-search inputs."""
+    if chunk_types is not None:
+        invalid = set(chunk_types) - VALID_CHUNK_TYPES
+        if invalid:
+            raise ToolError(
+                f"Invalid chunk_types: {invalid}. "
+                f"Valid values: {', '.join(sorted(VALID_CHUNK_TYPES))}"
+            )
+
+    if section_weights is not None:
+        errors = validate_section_weights(section_weights)
+        if errors:
+            raise ToolError(f"Invalid section_weights: {'; '.join(errors)}")
+
+    if journal_weights is not None:
+        errors = validate_journal_weights(journal_weights)
+        if errors:
+            raise ToolError(f"Invalid journal_weights: {'; '.join(errors)}")
+
+
+def _rerank_results(
+    results: list[RetrievalResult],
+    section_weights: dict[str, float] | None = None,
+    journal_weights: dict[str, float] | None = None,
+) -> list[RetrievalResult]:
+    """Apply reranking or mirror base similarity into composite_score."""
+    reranker = _get_reranker()
+    if _config.rerank_enabled:
+        return reranker.rerank(results, section_weights, journal_weights)
+    return [replace(r, composite_score=r.score) for r in results]
+
+
+def _select_diverse_passages(
+    hits: list[RetrievalResult],
+    passages_per_paper: int,
+    context_chunks: int,
+) -> list[RetrievalResult]:
+    """Keep top passages per document while avoiding local chunk redundancy."""
+    selected = []
+    min_gap = (2 * context_chunks) + 1
+
+    for hit in hits:
+        if any(abs(hit.chunk_index - kept.chunk_index) <= min_gap for kept in selected):
+            continue
+        selected.append(hit)
+        if len(selected) >= passages_per_paper:
+            break
+
+    return selected
+
+
 @mcp.tool()
 def search_papers(
     query: str,
@@ -385,26 +435,7 @@ def search_papers(
     """
     start = time.perf_counter()
 
-    # Validate chunk_types if provided
-    if chunk_types is not None:
-        invalid = set(chunk_types) - VALID_CHUNK_TYPES
-        if invalid:
-            raise ToolError(
-                f"Invalid chunk_types: {invalid}. "
-                f"Valid values: {', '.join(sorted(VALID_CHUNK_TYPES))}"
-            )
-
-    # Validate section_weights if provided
-    if section_weights is not None:
-        errors = validate_section_weights(section_weights)
-        if errors:
-            raise ToolError(f"Invalid section_weights: {'; '.join(errors)}")
-
-    # Validate journal_weights if provided
-    if journal_weights is not None:
-        errors = validate_journal_weights(journal_weights)
-        if errors:
-            raise ToolError(f"Invalid journal_weights: {'; '.join(errors)}")
+    _validate_search_inputs(chunk_types, section_weights, journal_weights)
 
     retriever = _get_retriever()
     reranker = _get_reranker()
@@ -574,6 +605,139 @@ def search_topic(
 
     paper_results.sort(key=lambda p: p["avg_composite_score"], reverse=True)
     logger.debug(f"search_topic: {time.perf_counter() - start:.3f}s")
+    return paper_results[:num_papers]
+
+
+@mcp.tool()
+def search_diverse_papers(
+    query: str,
+    num_papers: int = 8,
+    passages_per_paper: int = 3,
+    context_chunks: int = 1,
+    year_min: int | None = None,
+    year_max: int | None = None,
+    author: str | None = None,
+    tag: str | None = None,
+    collection: str | None = None,
+    chunk_types: list[str] | None = None,
+    section_weights: dict[str, float] | None = None,
+    journal_weights: dict[str, float] | None = None,
+    required_terms: list[str] | None = None,
+) -> list[dict]:
+    """
+    Diversified paper-level semantic search with multiple passages per paper.
+
+    Searches across chunks, reranks candidates, groups them by paper, and
+    returns distinct papers with their strongest non-redundant passages.
+    This is intended for topic exploration when chunk-level search is too
+    concentrated on a single document.
+
+    Args:
+        query: Natural language topic description
+        num_papers: Number of distinct papers to return (1-50)
+        passages_per_paper: Max passages to keep per paper (1-5)
+        context_chunks: Adjacent chunks to include around each passage (0-3)
+        year_min: Minimum publication year filter
+        year_max: Maximum publication year filter
+        author: Filter by author name (case-insensitive substring match)
+        tag: Filter by Zotero tag (case-insensitive substring match)
+        collection: Filter by Zotero collection name (substring match)
+        chunk_types: Filter by content type. Valid values: text, figure,
+            table. Pass a list to include multiple (e.g. ["text", "table"]).
+            Omit or pass null to search all types.
+        section_weights: Override section relevance weights. Keys are section
+            labels: abstract, introduction, background, methods, results,
+            discussion, conclusion, references, appendix, preamble, table,
+            unknown. Values are 0.0-1.0. Set a section to 0 to exclude it.
+        journal_weights: Override journal quartile weights. Keys: Q1, Q2,
+            Q3, Q4, unknown. Values are 0.0-1.0.
+        required_terms: List of words that must appear as whole words in the
+            kept passages (case-insensitive).
+
+    Returns:
+        List of distinct papers with ranked passage lists and metadata.
+    """
+    start = time.perf_counter()
+    _validate_search_inputs(chunk_types, section_weights, journal_weights)
+
+    num_papers = max(1, min(num_papers, 50))
+    passages_per_paper = max(1, min(passages_per_paper, 5))
+    context_chunks = max(0, min(context_chunks, 3))
+
+    retriever = _get_retriever()
+
+    base_fetch = min(
+        num_papers
+        * passages_per_paper
+        * _config.oversample_topic_factor
+        * _config.oversample_multiplier,
+        900
+    )
+    has_post_filters = _has_text_filters(author, tag, collection) or required_terms
+    fetch_k = base_fetch * 2 if has_post_filters else base_fetch
+
+    results = retriever.search(
+        query=query,
+        top_k=fetch_k,
+        context_window=context_chunks,
+        filters=_build_chromadb_filters(year_min, year_max, chunk_types)
+    )
+    results = _apply_text_filters(results, author, tag, collection)
+    if required_terms:
+        results = _apply_required_terms(results, required_terms)
+
+    reranked = _rerank_results(results, section_weights, journal_weights)
+
+    by_doc: dict[str, list[RetrievalResult]] = defaultdict(list)
+    for result in reranked:
+        by_doc[result.doc_id].append(result)
+
+    paper_results = []
+    for doc_id, hits in by_doc.items():
+        ranked_hits = sorted(
+            hits,
+            key=lambda hit: (
+                hit.composite_score if hit.composite_score is not None else hit.score,
+                hit.score,
+            ),
+            reverse=True,
+        )
+        selected_hits = _select_diverse_passages(ranked_hits, passages_per_paper, context_chunks)
+        if not selected_hits:
+            continue
+
+        kept_scores = [
+            hit.composite_score if hit.composite_score is not None else hit.score
+            for hit in selected_hits
+        ]
+        lead_hit = selected_hits[0]
+        doc_score = sum(kept_scores) / len(kept_scores)
+        best_passage_score = max(kept_scores)
+
+        paper_results.append({
+            "doc_id": doc_id,
+            "doc_title": lead_hit.doc_title,
+            "authors": lead_hit.authors,
+            "year": lead_hit.year,
+            "citation_key": lead_hit.citation_key,
+            "publication": lead_hit.publication,
+            "journal_quartile": lead_hit.journal_quartile,
+            "doc_score": round(doc_score, 3),
+            "best_passage_score": round(best_passage_score, 3),
+            "num_selected_passages": len(selected_hits),
+            "num_candidate_chunks": len(hits),
+            "passages": [_result_to_dict(hit) for hit in selected_hits],
+        })
+
+    paper_results.sort(
+        key=lambda paper: (
+            paper["doc_score"],
+            paper["best_passage_score"],
+            paper["num_selected_passages"],
+        ),
+        reverse=True,
+    )
+    logger.debug(f"search_diverse_papers: {time.perf_counter() - start:.3f}s")
     return paper_results[:num_papers]
 
 
@@ -958,6 +1122,7 @@ def index_library(
     item_key: str | None = None,
     title_pattern: str | None = None,
     no_vision: bool = False,
+    ocr_mode: str = "auto",
 ) -> dict:
     """
     Index Zotero PDFs into the vector store.
@@ -972,6 +1137,7 @@ def index_library(
         item_key: Index only this specific Zotero item key
         title_pattern: Regex pattern to filter items by title (case-insensitive)
         no_vision: Disable vision-based table extraction for this run
+        ocr_mode: OCR mode: "auto", "always", or "off"
 
     Returns:
         Summary with counts of indexed/failed/skipped items and quality stats
@@ -991,12 +1157,21 @@ def index_library(
         from dataclasses import replace as dc_replace
         config = dc_replace(_config, vision_enabled=False)
 
+    if ocr_mode not in {"auto", "always", "off"}:
+        raise ToolError("ocr_mode must be one of: auto, always, off")
+
+    tmp_dir = config.chroma_db_path.parent / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    for tmp_env in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[tmp_env] = str(tmp_dir)
+
     indexer = Indexer(config)
     result = indexer.index_all(
         force_reindex=force_reindex,
         limit=limit,
         item_key=item_key,
         title_pattern=title_pattern,
+        ocr_mode=ocr_mode,
     )
 
     # Serialize IndexResult objects

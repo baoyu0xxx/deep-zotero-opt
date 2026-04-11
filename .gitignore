@@ -1,9 +1,19 @@
 /.venv/
 /.claude/
 pytest_cache/
+.tmp/
+.runtime-data/
+.runtime-tmp/
+extraction-cache/
+.pytest_cache/
+.pytest-tmp/
+pytest-cache-files-*/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+build/
+dist/
 
 # Stress test outputs (large, regenerated on each run)
 _stress_test_figures/

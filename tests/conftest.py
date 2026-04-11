@@ -6,10 +6,19 @@ All fixtures that need to be shared across test modules should be defined here.
 from __future__ import annotations
 
 import csv
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PYTEST_TMP_ROOT = Path(
+    os.environ.get("DEEP_ZOTERO_TEST_TMP", _PROJECT_ROOT / ".pytest-tmp")
+)
+_PYTEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+for _tmp_env in ("TMP", "TEMP", "TMPDIR"):
+    os.environ[_tmp_env] = str(_PYTEST_TMP_ROOT)
 
 _FIXTURES_DIR = Path(__file__).parent / "fixtures" / "papers"
 _PAPER_NAMES = ["noname1.pdf", "noname2.pdf", "noname3.pdf"]

@@ -395,8 +395,7 @@ class TestServerToolsAcceptFilters:
         """search_papers tool description should mention filter params."""
         from deep_zotero.server import search_papers
 
-        # FastMCP tools have a description attribute
-        desc = search_papers.description if hasattr(search_papers, 'description') else str(search_papers)
+        desc = getattr(search_papers, "description", None) or (search_papers.__doc__ or "")
 
         assert "author" in desc.lower(), "search_papers description should mention 'author'"
         assert "tag" in desc.lower(), "search_papers description should mention 'tag'"
@@ -406,7 +405,7 @@ class TestServerToolsAcceptFilters:
         """search_topic tool description should mention filter params."""
         from deep_zotero.server import search_topic
 
-        desc = search_topic.description if hasattr(search_topic, 'description') else str(search_topic)
+        desc = getattr(search_topic, "description", None) or (search_topic.__doc__ or "")
 
         assert "author" in desc.lower(), "search_topic description should mention 'author'"
         assert "tag" in desc.lower(), "search_topic description should mention 'tag'"
@@ -416,7 +415,7 @@ class TestServerToolsAcceptFilters:
         """search_tables tool description should mention filter params."""
         from deep_zotero.server import search_tables
 
-        desc = search_tables.description if hasattr(search_tables, 'description') else str(search_tables)
+        desc = getattr(search_tables, "description", None) or (search_tables.__doc__ or "")
 
         assert "author" in desc.lower(), "search_tables description should mention 'author'"
         assert "tag" in desc.lower(), "search_tables description should mention 'tag'"
