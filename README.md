@@ -1,25 +1,59 @@
 # DeepZotero
 
-Semantic search over a Zotero library. PDFs are extracted (text, tables, figures), chunked, embedded, and stored in ChromaDB. An MCP server exposes the index to Claude Code (or any MCP client) as 14 tools for semantic search, boolean search, table/figure search, context expansion, citation graph lookup, indexing, and cost tracking.
+Semantic search over a Zotero library. PDFs are extracted into text, tables, and figures, chunked, embedded, and stored in ChromaDB. An MCP server exposes the index to Claude Code or any other MCP client for semantic search, diversified paper retrieval, boolean search, table/figure search, context expansion, citation lookup, indexing, and cost inspection.
 
 ## Workspace Guidance
 
 - Open Codex at `D:\pyproject`. That is the trusted workspace root.
-- `zotero_rag&mcp` is a helper/wrapper workspace only.
-- `deep-zotero` remains the canonical MCP entrypoint and is the repo referenced by the server config.
+- `zotero_rag&mcp` is only a helper/wrapper workspace.
+- `deep-zotero-opt` is the canonical working repository and MCP entrypoint.
+- The recommended long-term working directory is `D:\pyproject\deep-zotero-opt`.
 
-## What it extracts
+Current Windows MCP config:
 
-- **Text** — section-aware chunks with overlap, classified by document section (abstract, methods, results, etc.)
-- **Tables** — vision-based extraction via Claude Haiku 4.5. Each table is rendered to PNG and transcribed to structured markdown (headers, rows, footnotes). Falls back to PyMuPDF heuristics if vision is disabled.
-- **Figures** — detected with captions, extracted as PNGs, searchable by caption text.
+```json
+{
+  "mcpServers": {
+    "deep-zotero": {
+      "command": "D:\\pyproject\\deep-zotero-opt\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "deep_zotero.server"]
+    }
+  }
+}
+```
+
+## Current Practical Setup
+
+This fork has been adjusted for a local Windows workflow:
+
+- Repo: `D:\pyproject\deep-zotero-opt`
+- Repo-local virtual environment: `.venv`
+- Zotero data can point to a local backup such as `D:\zotero_backup`
+- ChromaDB can point to a dedicated local index such as `C:\Users\28055\.local\share\deep-zotero\chroma_qwen`
+- MCP runs from the repo-local Python
+- Embeddings can be provided by Gemini, Chroma's local fallback, or a local OpenAI-compatible endpoint such as Qwen
+
+This setup has already been validated in this repo by:
+
+- starting the MCP server from `deep-zotero-opt`
+- running semantic retrieval through `search_diverse_papers`
+- running tests such as `tests/test_server_diverse_search.py`
+
+## What It Extracts
+
+- Text: section-aware chunks with overlap, classified by document section such as abstract, methods, results, and conclusion
+- Tables: vision-based extraction via Claude Haiku 4.5 when enabled, with fallback heuristics when vision is disabled
+- Figures: detected with captions, extracted as PNGs, searchable by caption text
 
 ## Requirements
 
 - Python 3.10+
-- A [Gemini API key](https://aistudio.google.com/app/apikey) for embeddings (unless using `embedding_provider: "local"`)
-- An [Anthropic API key](https://console.anthropic.com/) for vision-based table extraction (optional but recommended)
-- A Zotero installation with PDFs in `storage/`
+- A Zotero installation or backup containing `zotero.sqlite` and `storage/`
+- One embedding backend:
+  - Gemini API for `embedding_provider: "gemini"`
+  - Local Chroma embedding fallback for `embedding_provider: "local"`
+  - A local or remote OpenAI-compatible `/v1/embeddings` endpoint for `embedding_provider: "openai_compatible"`
+- An Anthropic API key if you want vision-based table extraction
 
 ## Install
 
@@ -43,36 +77,74 @@ mkdir -p ~/.config/deep-zotero
 cp config.example.json ~/.config/deep-zotero/config.json
 ```
 
-Edit `~/.config/deep-zotero/config.json`:
+Minimal Gemini-based config:
 
 ```json
 {
-    "zotero_data_dir": "~/Zotero",
-    "chroma_db_path": "~/.local/share/deep-zotero/chroma",
-    "gemini_api_key": "YOUR_GEMINI_KEY",
-    "anthropic_api_key": "YOUR_ANTHROPIC_KEY"
+  "zotero_data_dir": "~/Zotero",
+  "chroma_db_path": "~/.local/share/deep-zotero/chroma",
+  "embedding_provider": "gemini",
+  "embedding_model": "gemini-embedding-001",
+  "embedding_dimensions": 768,
+  "gemini_api_key": "YOUR_GEMINI_KEY",
+  "anthropic_api_key": "YOUR_ANTHROPIC_KEY"
 }
 ```
 
-All other fields have sensible defaults. You can also set `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` as environment variables instead.
+Example local Qwen / OpenAI-compatible config:
 
-### 2. API keys
+```json
+{
+  "zotero_data_dir": "D:\\zotero_backup",
+  "chroma_db_path": "C:\\Users\\28055\\.local\\share\\deep-zotero\\chroma_qwen",
+  "embedding_provider": "openai_compatible",
+  "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+  "embedding_dimensions": 1024,
+  "embedding_base_url": "http://127.0.0.1:8000/v1",
+  "embedding_api_key": "EMPTY",
+  "embedding_query_instruction": null,
+  "embedding_auto_start": true,
+  "embedding_startup_timeout": 180.0,
+  "vision_enabled": false,
+  "ocr_language": "eng"
+}
+```
 
-**Gemini (required for default embeddings):**
-Get a key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey). Set it as `gemini_api_key` in config or `GEMINI_API_KEY` env var. If you don't want to use Gemini, set `"embedding_provider": "local"` to use ChromaDB's built-in all-MiniLM-L6-v2 model (no API key needed, lower quality).
+### 2. Embedding And API Keys
 
-**Anthropic (required for vision table extraction):**
-Get a key at [console.anthropic.com](https://console.anthropic.com/). Set it as `anthropic_api_key` in config or `ANTHROPIC_API_KEY` env var. Without this key, tables are still extracted via PyMuPDF heuristics but accuracy on complex tables is lower. Vision extraction uses the Anthropic Batch API with Claude Haiku 4.5 — cost is roughly $0.016 per table, with prompt caching reducing cost on large batches.
+Gemini mode:
+
+- Set `embedding_provider` to `"gemini"`
+- Set `gemini_api_key` in config, or use `GEMINI_API_KEY`
+
+Local fallback mode:
+
+- Set `embedding_provider` to `"local"`
+- No API key is required
+- This uses Chroma's default `all-MiniLM-L6-v2` embedding model
+
+OpenAI-compatible mode:
+
+- Set `embedding_provider` to `"openai_compatible"`
+- Set `embedding_base_url`, for example `http://127.0.0.1:8000/v1`
+- Set `embedding_api_key`, which may be a placeholder such as `"EMPTY"` if your local server ignores auth
+- Set `embedding_model` and `embedding_dimensions` to match the served model
+- Optional: set `embedding_query_instruction` to prepend a retrieval instruction to query embeddings
+
+Anthropic vision mode:
+
+- Set `anthropic_api_key` in config, or use `ANTHROPIC_API_KEY`
+- If omitted, table extraction falls back to non-vision heuristics
 
 To disable vision extraction entirely:
 
 ```json
 {
-    "vision_enabled": false
+  "vision_enabled": false
 }
 ```
 
-### 3. Index your library
+### 3. Index Your Library
 
 ```bash
 deep-zotero-index -v
@@ -84,7 +156,7 @@ To test with a subset first:
 deep-zotero-index --limit 10 -v
 ```
 
-This reads the Zotero SQLite database (read-only, safe while Zotero is open), extracts text/tables/figures from each PDF, chunks the text, embeds via Gemini, and stores everything in ChromaDB.
+This reads the Zotero SQLite database in read-only mode, extracts text/tables/figures from each PDF, chunks the text, embeds via the configured backend, and stores everything in ChromaDB.
 
 CLI options:
 
@@ -95,171 +167,175 @@ CLI options:
 | `--item-key KEY` | Index a single Zotero item |
 | `--title PATTERN` | Regex filter on title (case-insensitive) |
 | `--no-vision` | Skip vision table extraction for this run |
-| `--ocr-mode auto\|always\|off` | Control OCR for this run; `always` requires GPU OCR to be available |
+| `--ocr-mode auto\|always\|off` | Control OCR for this run |
 | `--temp-dir PATH` | Put Python/native temporary files under a specific directory |
 | `--config PATH` | Use a different config file |
 | `-v` | Debug logging |
 
-The indexer is incremental — it only processes items not already in the index. Use `--force` after changing `chunk_size`, `embedding_dimensions`, `ocr_language`, or OCR mode.
+The indexer is incremental. Use `--force` after changing chunking settings, embedding dimensions, OCR mode, or OCR language.
 
-You can also trigger indexing from the MCP client via the `index_library` tool.
+### 4. Register The MCP Server
 
-### 4. Register the MCP server
-
-Add to your Claude Code settings (`~/.claude/settings.json`):
+Add this to your Claude Code settings:
 
 ```json
 {
-    "mcpServers": {
-        "deep-zotero": {
-            "command": "/path/to/.venv/bin/python",
-            "args": ["-m", "deep_zotero.server"]
-        }
+  "mcpServers": {
+    "deep-zotero": {
+      "command": "D:\\pyproject\\deep-zotero-opt\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "deep_zotero.server"]
     }
+  }
 }
 ```
 
-On Windows:
+Restart the client after updating MCP config.
 
-```json
-{
-    "mcpServers": {
-        "deep-zotero": {
-            "command": "C:\\path\\to\\.venv\\Scripts\\python.exe",
-            "args": ["-m", "deep_zotero.server"]
-        }
-    }
-}
-```
-
-Restart Claude Code. All 14 tools will be available.
-
----
-
-## Configuration reference
+## Configuration Reference
 
 ### Zotero
 
 | Field | Default | Description |
 |---|---|---|
-| `zotero_data_dir` | `~/Zotero` | Path to Zotero's data directory (contains `zotero.sqlite` and `storage/`) |
-| `chroma_db_path` | `~/.local/share/deep-zotero/chroma` | Where the ChromaDB index is stored on disk |
+| `zotero_data_dir` | `~/Zotero` | Path to Zotero data directory containing `zotero.sqlite` and `storage/` |
+| `chroma_db_path` | `~/.local/share/deep-zotero/chroma` | Path to on-disk ChromaDB index |
 
 ### Embedding
 
 | Field | Default | Description |
 |---|---|---|
-| `embedding_provider` | `"gemini"` | `"gemini"` for Gemini API, `"local"` for ChromaDB's built-in all-MiniLM-L6-v2 (no key needed) |
-| `embedding_model` | `"gemini-embedding-001"` | Gemini model name (only used when provider is `"gemini"`) |
-| `embedding_dimensions` | `768` | Output vector dimensions. `gemini-embedding-001` supports 64-3072. Changing requires `--force` re-index |
-| `gemini_api_key` | `null` | Falls back to `GEMINI_API_KEY` env var |
-| `embedding_timeout` | `120.0` | Timeout in seconds for embedding API calls |
-| `embedding_max_retries` | `3` | Max retries for failed embedding calls |
+| `embedding_provider` | `"gemini"` | `"gemini"`, `"local"`, or `"openai_compatible"` |
+| `embedding_model` | `"gemini-embedding-001"` | Embedding model name |
+| `embedding_dimensions` | `768` | Output vector dimensions |
+| `gemini_api_key` | `null` | Falls back to `GEMINI_API_KEY` |
+| `embedding_base_url` | `null` | Base URL for OpenAI-compatible embeddings |
+| `embedding_api_key` | `null` | API key for OpenAI-compatible embeddings |
+| `embedding_query_instruction` | `null` | Optional query prefix/instruction |
+| `embedding_batch_size` | `8` | Batch size for OpenAI-compatible embedding requests |
+| `embedding_auto_start` | `false` | Whether to auto-start the embedding endpoint |
+| `embedding_startup_timeout` | `180.0` | Time to wait for embedding endpoint readiness |
+| `embedding_start_command` | `null` | Optional startup command for embedding service |
+| `embedding_timeout` | `120.0` | Per-request timeout |
+| `embedding_max_retries` | `3` | Retry count for failed embedding calls |
 
 ### Chunking
 
 | Field | Default | Description |
 |---|---|---|
-| `chunk_size` | `400` | Target chunk size in tokens (~4 chars/token). Changing requires `--force` re-index |
-| `chunk_overlap` | `100` | Overlap between consecutive chunks in tokens |
+| `chunk_size` | `400` | Target chunk size in tokens |
+| `chunk_overlap` | `100` | Overlap between adjacent chunks |
 
 ### Vision
 
 | Field | Default | Description |
 |---|---|---|
-| `vision_enabled` | `true` | Enable vision table extraction during indexing |
+| `vision_enabled` | `true` | Enable vision-based table extraction |
 | `vision_model` | `"claude-haiku-4-5-20251001"` | Anthropic model for table transcription |
-| `anthropic_api_key` | `null` | Falls back to `ANTHROPIC_API_KEY` env var |
+| `anthropic_api_key` | `null` | Falls back to `ANTHROPIC_API_KEY` |
 
 ### Reranking
 
 | Field | Default | Description |
 |---|---|---|
 | `rerank_enabled` | `true` | Enable composite score reranking |
-| `rerank_alpha` | `0.7` | Similarity exponent (0-1). Lower = more metadata influence |
-| `rerank_section_weights` | `null` | Override default section weights |
-| `rerank_journal_weights` | `null` | Override default journal quartile weights |
+| `rerank_alpha` | `0.7` | Similarity exponent |
+| `rerank_section_weights` | `null` | Optional default section weight overrides |
+| `rerank_journal_weights` | `null` | Optional default quartile weight overrides |
 | `oversample_multiplier` | `3` | Oversample factor before reranking |
-| `oversample_topic_factor` | `5` | Additional factor for `search_topic` |
-| `stats_sample_limit` | `10000` | Max chunks sampled for `get_index_stats` |
+| `oversample_topic_factor` | `5` | Additional factor for topic-style searches |
+| `stats_sample_limit` | `10000` | Max chunk sample size for stats |
 
 ### OCR
 
 | Field | Default | Description |
 |---|---|---|
-| `ocr_language` | `"eng"` | Tesseract language code for scanned pages (`"fra"`, `"deu"`, etc.). Changing requires `--force` re-index |
+| `ocr_language` | `"eng"` | OCR language code |
 
 ### OpenAlex
 
 | Field | Default | Description |
 |---|---|---|
-| `openalex_email` | `null` | Email for OpenAlex polite pool (10 req/s vs 1 req/s). Falls back to `OPENALEX_EMAIL` env var |
+| `openalex_email` | `null` | Optional OpenAlex polite-pool email |
 
----
+## MCP Tools
 
-## MCP tools
+### Semantic Search
 
-### Semantic search
+`search_papers`
 
-**`search_papers`** — Passage-level semantic search. Returns matching text with surrounding context, reranked by composite score (similarity × section weight × journal weight). Supports `required_terms` for combining semantic search with exact word matching — each term must appear as a whole word in the passage.
+- Passage-level semantic search
+- Best when you want the strongest raw passages
+- Supports `required_terms` for exact whole-word filtering on top of semantic retrieval
 
-Parameters: `query`, `top_k` (1-50), `context_chunks` (0-3), `year_min`, `year_max`, `author`, `tag`, `collection`, `chunk_types` (text/figure/table), `section_weights`, `journal_weights`, `required_terms` (list of words that must appear in passage).
+`search_topic`
 
-**`search_topic`** — Paper-level topic search, deduplicated by document. Groups chunks by paper, scores by average and best composite relevance.
+- Paper-level topic search deduplicated by document
+- Good for ranking whole papers rather than passages
 
-Parameters: `query`, `num_papers` (1-50), `year_min`, `year_max`, `author`, `tag`, `collection`, `chunk_types`, `section_weights`, `journal_weights`.
+`search_diverse_papers`
 
-**`search_tables`** — Semantic search over table content (headers, cells, captions). Returns tables as markdown.
+- Diversified paper-level semantic search
+- Returns distinct papers plus a few non-overlapping top passages per paper
+- Recommended as the first tool for literature discovery because it prevents one paper from dominating the result set
 
-Parameters: `query`, `top_k` (1-30), `year_min`, `year_max`, `author`, `tag`, `collection`, `journal_weights`.
+`search_tables`
 
-**`search_figures`** — Semantic search over figure captions. Returns figure metadata and paths to extracted PNGs.
+- Semantic search over table content
 
-Parameters: `query`, `top_k` (1-30), `year_min`, `year_max`, `author`, `tag`, `collection`.
+`search_figures`
 
-**`search_diverse_papers`** - Diversified paper-level semantic search. Returns distinct papers plus up to a few non-overlapping top passages per paper, so one dominant document does not crowd out the rest of the result set.
+- Semantic search over figure captions
 
-Parameters: `query`, `num_papers` (1-50), `passages_per_paper` (1-5), `context_chunks` (0-3), `year_min`, `year_max`, `author`, `tag`, `collection`, `chunk_types`, `section_weights`, `journal_weights`, `required_terms`.
+### Boolean Search
 
-### Boolean search
+`search_boolean`
 
-**`search_boolean`** — Exact word matching via Zotero's native full-text index. Returns papers (not passages) matching AND/OR word queries. No phrase search, no stemming.
+- Exact word matching via Zotero's full-text index
+- Useful when exact term presence matters more than semantic similarity
 
-Parameters: `query` (space-separated terms), `operator` (AND/OR), `year_min`, `year_max`.
+### Context Expansion
 
-### Context expansion
+`get_passage_context`
 
-**`get_passage_context`** — Expand context around a passage from `search_papers`. For table results, pass `table_page` and `table_index` to find body text citing the table.
+- Expands context around a passage hit
 
-Parameters: `doc_id`, `chunk_index`, `window` (1-5), `table_page`, `table_index`.
+### Citation Graph
 
-### Citation graph (OpenAlex)
+`find_citing_papers`
 
-Requires the document to have a DOI in Zotero.
+- Papers citing the current document
 
-**`find_citing_papers`** — Papers that cite a given document. Parameters: `doc_id`, `limit` (1-100).
+`find_references`
 
-**`find_references`** — Papers a document cites. Parameters: `doc_id`, `limit` (1-100).
+- References cited by the current document
 
-**`get_citation_count`** — Citation and reference counts. Parameters: `doc_id`.
+`get_citation_count`
 
-### Index management
+- Citation and reference counts
 
-**`index_library`** — Trigger indexing from the MCP client. Parameters: `force_reindex`, `limit`, `item_key`, `title_pattern`, `no_vision`, `ocr_mode`.
+### Index Management
 
-**`get_index_stats`** — Document/chunk/table/figure counts, section coverage, journal coverage.
+`index_library`
 
-**`get_reranking_config`** — Current reranking weights and valid override values.
+- Trigger indexing from the MCP client
 
-**`get_vision_costs`** — Vision API batch usage and cost summary. Parameters: `last_n` (recent entries to show).
+`get_index_stats`
 
----
+- Inspect document and chunk counts plus section coverage
+
+`get_reranking_config`
+
+- Inspect valid reranking weights and effective defaults
+
+`get_vision_costs`
+
+- Inspect vision API batch usage and cost summaries
 
 ## Reranking
 
-Search results are scored:
+Search results are scored as:
 
-```
+```text
 composite_score = similarity^alpha * section_weight * journal_weight
 ```
 
@@ -280,13 +356,15 @@ Default section weights:
 | appendix | 0.3 |
 | references | 0.1 |
 
-Default journal weights: Q1=1.0, Q2=0.85, Q3=0.65, Q4=0.45.
+Default journal weights:
 
-Override per-call via `section_weights` and `journal_weights` parameters. Set a section to 0 to exclude it. Disable reranking entirely with `"rerank_enabled": false`.
+- Q1 = 1.0
+- Q2 = 0.85
+- Q3 = 0.65
+- Q4 = 0.45
+- unknown = configurable via overrides
 
----
-
-## Shared filter parameters
+## Shared Filter Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -294,15 +372,13 @@ Override per-call via `section_weights` and `journal_weights` parameters. Set a 
 | `tag` | string | Case-insensitive substring match against Zotero tags |
 | `collection` | string | Case-insensitive substring match against collection names |
 | `year_min` / `year_max` | int | Publication year range |
-| `section_weights` | dict | Override section weights for this call |
-| `journal_weights` | dict | Override journal quartile weights |
-| `required_terms` | list | Exact whole-word matches required in passage (`search_papers` only) |
+| `section_weights` | dict | Override section weights for a call |
+| `journal_weights` | dict | Override journal quartile weights for a call |
+| `required_terms` | list | Exact whole-word matches required in passage text |
 
----
+## Debug Viewer
 
-## Debug viewer
-
-`tools/debug_viewer.py` is a PyQt6 browser for inspecting the ChromaDB index — view papers, tables (rendered markdown vs PDF), figures, and individual chunks.
+`tools/debug_viewer.py` is a PyQt6 browser for inspecting the ChromaDB index, including papers, tables, figures, and individual chunks.
 
 ```bash
 .venv/Scripts/python.exe tools/debug_viewer.py
