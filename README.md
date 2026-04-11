@@ -4,40 +4,7 @@ Semantic search over a Zotero library. PDFs are extracted into text, tables, and
 
 ## Workspace Guidance
 
-- Open Codex at `D:\pyproject`. That is the trusted workspace root.
-- `zotero_rag&mcp` is only a helper/wrapper workspace.
-- `deep-zotero-opt` is the canonical working repository and MCP entrypoint.
-- The recommended long-term working directory is `D:\pyproject\deep-zotero-opt`.
-
-Current Windows MCP config:
-
-```json
-{
-  "mcpServers": {
-    "deep-zotero": {
-      "command": "D:\\pyproject\\deep-zotero-opt\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "deep_zotero.server"]
-    }
-  }
-}
-```
-
-## Current Practical Setup
-
-This fork has been adjusted for a local Windows workflow:
-
-- Repo: `D:\pyproject\deep-zotero-opt`
-- Repo-local virtual environment: `.venv`
-- Zotero data can point to a local backup such as `D:\zotero_backup`
-- ChromaDB can point to a dedicated local index such as `C:\Users\28055\.local\share\deep-zotero\chroma_qwen`
-- MCP runs from the repo-local Python
-- Embeddings can be provided by Gemini, Chroma's local fallback, or a local OpenAI-compatible endpoint such as Qwen
-
-This setup has already been validated in this repo by:
-
-- starting the MCP server from `deep-zotero-opt`
-- running semantic retrieval through `search_diverse_papers`
-- running tests such as `tests/test_server_diverse_search.py`
+Use the repository's repo-local virtual environment and MCP settings for your machine. The server is started with the repo's Python entrypoint and can be pointed at any valid Zotero data directory and ChromaDB path through configuration.
 
 ## What It Extracts
 
@@ -91,17 +58,17 @@ Minimal Gemini-based config:
 }
 ```
 
-Example local Qwen / OpenAI-compatible config:
+Example OpenAI-compatible config:
 
 ```json
 {
-  "zotero_data_dir": "D:\\zotero_backup",
-  "chroma_db_path": "C:\\Users\\28055\\.local\\share\\deep-zotero\\chroma_qwen",
+  "zotero_data_dir": "/path/to/zotero",
+  "chroma_db_path": "/path/to/chroma",
   "embedding_provider": "openai_compatible",
-  "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+  "embedding_model": "your-embedding-model",
   "embedding_dimensions": 1024,
-  "embedding_base_url": "http://127.0.0.1:8000/v1",
-  "embedding_api_key": "EMPTY",
+  "embedding_base_url": "http://localhost:8000/v1",
+  "embedding_api_key": "YOUR_API_KEY",
   "embedding_query_instruction": null,
   "embedding_auto_start": true,
   "embedding_startup_timeout": 180.0,
@@ -126,8 +93,8 @@ Local fallback mode:
 OpenAI-compatible mode:
 
 - Set `embedding_provider` to `"openai_compatible"`
-- Set `embedding_base_url`, for example `http://127.0.0.1:8000/v1`
-- Set `embedding_api_key`, which may be a placeholder such as `"EMPTY"` if your local server ignores auth
+- Set `embedding_base_url` to your embeddings endpoint
+- Set `embedding_api_key` to the value required by that endpoint
 - Set `embedding_model` and `embedding_dimensions` to match the served model
 - Optional: set `embedding_query_instruction` to prepend a retrieval instruction to query embeddings
 
@@ -182,7 +149,7 @@ Add this to your Claude Code settings:
 {
   "mcpServers": {
     "deep-zotero": {
-      "command": "D:\\pyproject\\deep-zotero-opt\\.venv\\Scripts\\python.exe",
+      "command": "/path/to/repo/.venv/bin/python",
       "args": ["-m", "deep_zotero.server"]
     }
   }
