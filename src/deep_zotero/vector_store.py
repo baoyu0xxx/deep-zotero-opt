@@ -1,6 +1,7 @@
 """ChromaDB vector storage with chunk management."""
 import logging
 import re
+from collections import defaultdict
 import chromadb
 from chromadb.config import Settings
 from pathlib import Path
@@ -472,6 +473,53 @@ class VectorStore:
                 ))
 
         return sorted(chunks, key=lambda c: c.metadata['chunk_index'])
+
+    def get_adjacent_chunks_batch(
+        self,
+        centers: list[tuple[str, int]],
+        window: int = 2,
+    ) -> dict[tuple[str, int], list[StoredChunk]]:
+        """Fetch adjacent chunks with one Chroma request per document."""
+        if not centers:
+            return {}
+
+        centers_by_doc: dict[str, list[int]] = defaultdict(list)
+        for doc_id, chunk_index in centers:
+            centers_by_doc[doc_id].append(chunk_index)
+
+        results_by_center: dict[tuple[str, int], list[StoredChunk]] = {}
+        for doc_id, chunk_indexes in centers_by_doc.items():
+            results = self.collection.get(
+                where={
+                    "$and": [
+                        {"doc_id": {"$eq": doc_id}},
+                        {"chunk_index": {"$gte": min(chunk_indexes) - window}},
+                        {"chunk_index": {"$lte": max(chunk_indexes) + window}},
+                    ]
+                },
+                include=["documents", "metadatas"],
+            )
+
+            chunks = []
+            if results["ids"]:
+                for i, chunk_id in enumerate(results["ids"]):
+                    chunks.append(
+                        StoredChunk(
+                            id=chunk_id,
+                            text=results["documents"][i],
+                            metadata=results["metadatas"][i],
+                        )
+                    )
+            chunks.sort(key=lambda c: c.metadata["chunk_index"])
+
+            for chunk_index in chunk_indexes:
+                results_by_center[(doc_id, chunk_index)] = [
+                    chunk
+                    for chunk in chunks
+                    if abs(chunk.metadata["chunk_index"] - chunk_index) <= window
+                ]
+
+        return results_by_center
 
     def delete_document(self, doc_id: str) -> None:
         """Remove all chunks for a document."""

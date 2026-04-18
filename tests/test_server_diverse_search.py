@@ -99,10 +99,34 @@ class FakeRetriever:
     def __init__(self, results):
         self.results = list(results)
         self.calls = []
+        self.search_base_calls = []
+        self.expand_context_calls = []
+        self.search_calls = []
 
     def search(self, *args, **kwargs):
         self.calls.append({"args": args, "kwargs": kwargs})
+        self.search_calls.append({"args": args, "kwargs": kwargs})
         return list(self.results)
+
+    def search_base(self, *args, **kwargs):
+        self.search_base_calls.append({"args": args, "kwargs": kwargs})
+        return list(self.results)
+
+    def expand_context(self, results, context_window=1):
+        self.expand_context_calls.append({
+            "results_count": len(results),
+            "context_window": context_window,
+        })
+        if context_window <= 0:
+            return list(results)
+        return [
+            replace(
+                r,
+                context_before=[f"before-{r.doc_id}-{r.chunk_index}"],
+                context_after=[f"after-{r.doc_id}-{r.chunk_index}"],
+            )
+            for r in results
+        ]
 
 
 class FakeReranker:
@@ -180,7 +204,8 @@ class TestSearchDiversePapersBehavior:
             max_chunks_per_doc=2,
         )
 
-        assert retriever.calls, "expected the retriever to be queried"
+        assert retriever.search_base_calls, "expected the retriever to be queried"
+        assert not retriever.search_calls, "candidate retrieval should use search_base without eager context expansion"
         assert reranker.calls, "expected reranking to remain enabled in this scenario"
 
         passage_records = _collect_passage_records(response)
@@ -238,7 +263,8 @@ class TestSearchDiversePapersBehavior:
             limit=4,
         )
 
-        assert retriever.calls, "expected the retriever to be queried"
+        assert retriever.search_base_calls, "expected the retriever to be queried"
+        assert not retriever.search_calls, "candidate retrieval should use search_base without eager context expansion"
         assert reranker.calls, "expected reranking to run after filtering"
         assert reranker.last_results is not None
         assert len(reranker.last_results) == 1, "required_terms should trim the candidate set before document grouping"
@@ -266,7 +292,8 @@ class TestSearchDiversePapersBehavior:
             limit=3,
         )
 
-        assert retriever.calls, "expected the retriever to be queried"
+        assert retriever.search_base_calls, "expected the retriever to be queried"
+        assert not retriever.search_calls, "candidate retrieval should use search_base without eager context expansion"
         assert not reranker.calls, "reranker should be bypassed when disabled"
 
         passage_records = _collect_passage_records(response)
@@ -277,3 +304,71 @@ class TestSearchDiversePapersBehavior:
                 assert record["composite_score"] == record["relevance_score"]
             if "avg_score" in record and "avg_composite_score" in record and record["avg_composite_score"] is not None:
                 assert record["avg_score"] == record["avg_composite_score"]
+
+    def test_context_expansion_applies_only_to_final_selected_passages(self, monkeypatch):
+        tool = _require_diverse_tool()
+        results = [
+            _make_result("doc-a", 1, "alpha", 0.99),
+            _make_result("doc-a", 5, "alpha 2", 0.98),
+            _make_result("doc-a", 9, "alpha 3", 0.97),
+            _make_result("doc-b", 2, "beta", 0.96),
+            _make_result("doc-b", 8, "beta 2", 0.95),
+            _make_result("doc-c", 3, "gamma", 0.94),
+        ]
+        retriever, _ = _patch_search_stack(monkeypatch, results)
+
+        response = _call_tool(
+            tool,
+            query="alpha beta gamma",
+            top_k=2,
+            passages_per_paper=2,
+            context_window=2,
+        )
+
+        assert retriever.search_base_calls
+        assert not retriever.search_calls
+        assert len(retriever.expand_context_calls) == 1, "context expansion should run once on final selected passages"
+
+        expanded_count = retriever.expand_context_calls[0]["results_count"]
+        assert expanded_count <= 4, "expanded passages should be capped by top_k * passages_per_paper"
+
+        returned_count = sum(len(paper.get("passages", [])) for paper in response.get("results", []))
+        assert expanded_count == returned_count
+
+
+def _require_topic_tool():
+    tool = getattr(server, "search_topic", None)
+    if tool is None:
+        pytest.xfail("search_topic is not implemented yet")
+    return tool
+
+
+class TestSearchTopicContextExpansion:
+    def test_expands_only_final_topk_lead_passages(self, monkeypatch):
+        tool = _require_topic_tool()
+        results = [
+            _make_result("doc-a", 1, "alpha", 0.99),
+            _make_result("doc-a", 2, "alpha second", 0.98),
+            _make_result("doc-b", 1, "beta", 0.95),
+            _make_result("doc-c", 1, "gamma", 0.90),
+        ]
+        retriever, reranker = _patch_search_stack(monkeypatch, results)
+
+        response = _call_tool(
+            tool,
+            query="alpha beta gamma",
+            top_k=2,
+            context_window=2,
+        )
+
+        assert retriever.search_base_calls, "expected base retrieval call"
+        assert not retriever.search_calls, "search_topic should avoid eager context expansion over candidates"
+        assert reranker.calls, "reranking should still run before grouping"
+
+        assert len(retriever.expand_context_calls) == 1, "lead passage context expansion should run once"
+        assert retriever.expand_context_calls[0]["results_count"] == 2, "expand only final top_k lead passages"
+
+        for paper in response.get("results", []):
+            lead = paper.get("lead_passage", {})
+            assert "context_before" in lead
+            assert "context_after" in lead

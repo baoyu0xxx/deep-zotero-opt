@@ -1,4 +1,6 @@
 """Search with automatic context expansion."""
+from dataclasses import replace
+
 from .models import StoredChunk, RetrievalResult
 from .interfaces import VectorStoreProtocol
 
@@ -14,6 +16,75 @@ class Retriever:
 
     def __init__(self, vector_store: VectorStoreProtocol):
         self.store = vector_store
+
+    @staticmethod
+    def _stored_chunk_to_result(hit: StoredChunk) -> RetrievalResult:
+        jq = hit.metadata.get("journal_quartile", "")
+        journal_quartile = jq if jq else None
+        return RetrievalResult(
+            chunk_id=hit.id,
+            text=hit.text,
+            score=hit.score,
+            doc_id=hit.metadata["doc_id"],
+            doc_title=hit.metadata["doc_title"],
+            authors=hit.metadata["authors"],
+            year=hit.metadata["year"] or None,
+            page_num=hit.metadata["page_num"],
+            chunk_index=hit.metadata["chunk_index"],
+            citation_key=hit.metadata.get("citation_key", ""),
+            publication=hit.metadata.get("publication", ""),
+            tags=hit.metadata.get("tags", ""),
+            collections=hit.metadata.get("collections", ""),
+            section=hit.metadata.get("section", "unknown"),
+            section_confidence=hit.metadata.get("section_confidence", 1.0),
+            journal_quartile=journal_quartile,
+        )
+
+    def search_base(
+        self,
+        query: str,
+        top_k: int = 10,
+        filters: dict | None = None,
+    ) -> list[RetrievalResult]:
+        """Search for relevant chunks without loading adjacent context."""
+        hits = self.store.search(query, top_k=top_k, filters=filters)
+        return [self._stored_chunk_to_result(hit) for hit in hits]
+
+    def expand_context(
+        self,
+        results: list[RetrievalResult],
+        context_window: int = 1,
+    ) -> list[RetrievalResult]:
+        """Load adjacent chunks only for preselected results."""
+        if context_window <= 0 or not results:
+            return results
+
+        centers = [(result.doc_id, result.chunk_index) for result in results]
+        adjacent_by_center = self.store.get_adjacent_chunks_batch(centers, window=context_window)
+
+        expanded = []
+        for result in results:
+            center_idx = result.chunk_index
+            adjacent = adjacent_by_center.get((result.doc_id, center_idx), [])
+
+            context_before = []
+            context_after = []
+            for adj in adjacent:
+                adj_idx = adj.metadata["chunk_index"]
+                if adj_idx < center_idx:
+                    context_before.append(adj.text)
+                elif adj_idx > center_idx:
+                    context_after.append(adj.text)
+
+            expanded.append(
+                replace(
+                    result,
+                    context_before=context_before,
+                    context_after=context_after,
+                )
+            )
+
+        return expanded
 
     def search(
         self,
@@ -34,55 +105,5 @@ class Retriever:
         Returns:
             List of RetrievalResult with expanded context
         """
-        hits = self.store.search(query, top_k=top_k, filters=filters)
-
-        results = []
-        for hit in hits:
-            # Get adjacent chunks
-            if context_window > 0:
-                adjacent = self.store.get_adjacent_chunks(
-                    hit.metadata["doc_id"],
-                    hit.metadata["chunk_index"],
-                    window=context_window
-                )
-            else:
-                adjacent = []
-
-            # Separate into before/after
-            context_before = []
-            context_after = []
-            center_idx = hit.metadata["chunk_index"]
-
-            for adj in adjacent:
-                adj_idx = adj.metadata["chunk_index"]
-                if adj_idx < center_idx:
-                    context_before.append(adj.text)
-                elif adj_idx > center_idx:
-                    context_after.append(adj.text)
-
-            # Handle journal_quartile - empty string from DB means None
-            jq = hit.metadata.get("journal_quartile", "")
-            journal_quartile = jq if jq else None
-
-            results.append(RetrievalResult(
-                chunk_id=hit.id,
-                text=hit.text,
-                score=hit.score,
-                doc_id=hit.metadata["doc_id"],
-                doc_title=hit.metadata["doc_title"],
-                authors=hit.metadata["authors"],
-                year=hit.metadata["year"] or None,
-                page_num=hit.metadata["page_num"],
-                chunk_index=hit.metadata["chunk_index"],
-                citation_key=hit.metadata.get("citation_key", ""),
-                publication=hit.metadata.get("publication", ""),
-                tags=hit.metadata.get("tags", ""),
-                collections=hit.metadata.get("collections", ""),
-                section=hit.metadata.get("section", "unknown"),
-                section_confidence=hit.metadata.get("section_confidence", 1.0),
-                journal_quartile=journal_quartile,
-                context_before=context_before,
-                context_after=context_after,
-            ))
-
-        return results
+        results = self.search_base(query, top_k=top_k, filters=filters)
+        return self.expand_context(results, context_window=context_window)

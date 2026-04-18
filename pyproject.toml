@@ -12,6 +12,7 @@ dependencies = [
     "chromadb>=0.4.0",
     "google-genai>=1.0.0",
     "openai>=1.0.0",
+    "sentence-transformers>=3.0.0",
     "pymupdf>=1.25.0",
     "pymupdf-layout",
     "pymupdf4llm>=0.0.17",
@@ -42,7 +43,7 @@ dev = [
 ]
 
 [project.scripts]
-deep-zotero = "deep_zotero.server:mcp.run"
+deep-zotero = "deep_zotero.server:main"
 deep-zotero-index = "deep_zotero.cli:main"
 
 [tool.pytest.ini_options]

@@ -1,9 +1,8 @@
 """MCP server with search tools."""
+import argparse
 import os
-import sys
 import time
 import logging
-import threading
 from collections import defaultdict
 from dataclasses import replace
 from fastmcp import FastMCP
@@ -19,9 +18,9 @@ from .reranker import (
     VALID_QUARTILES,
 )
 from .models import RetrievalResult
+from .mcp_bootstrap import bootstrap_mcp_server, collect_health_status
 
 logger = logging.getLogger(__name__)
-PARENT_MONITOR_ENV = "DEEP_ZOTERO_PARENT_MONITOR"
 
 # Try to import FastMCP's error type; define fallback if not available
 try:
@@ -30,55 +29,6 @@ except ImportError:
     class ToolError(Exception):
         """Error raised by MCP tools to signal failure to client."""
         pass
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off", ""}
-
-
-def _start_parent_monitor():
-    """
-    Monitor parent process and exit when it dies.
-
-    When the parent process (Claude Code) terminates, this process should
-    also exit. Without this monitor, the asyncio event loop may hang
-    indefinitely, leaving orphaned processes that consume CPU.
-    """
-    if not _env_flag(PARENT_MONITOR_ENV, True):
-        logger.info("Parent monitor disabled via %s", PARENT_MONITOR_ENV)
-        return
-
-    target_pid = os.getppid()
-
-    def monitor():
-        if sys.platform == 'win32':
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-
-            SYNCHRONIZE = 0x00100000
-            handle = kernel32.OpenProcess(SYNCHRONIZE, False, target_pid)
-
-            if handle:
-                # Wait for process to exit (blocks until process dies)
-                INFINITE = 0xFFFFFFFF
-                kernel32.WaitForSingleObject(handle, INFINITE)
-                kernel32.CloseHandle(handle)
-        else:
-            # Unix: poll parent PID
-            while True:
-                time.sleep(1.0)
-                try:
-                    os.kill(target_pid, 0)
-                except (OSError, PermissionError):
-                    break
-
-        os._exit(0)
-
-    thread = threading.Thread(target=monitor, daemon=True)
-    thread.start()
 
 
 mcp = FastMCP("deep-zotero")
@@ -90,10 +40,17 @@ _reranker = None
 _config = None
 
 
+def _get_config() -> Config:
+    global _config
+    if _config is None:
+        _config = Config.load()
+    return _config
+
+
 def _get_retriever() -> Retriever:
     global _retriever, _store, _reranker, _config
     if _retriever is None:
-        _config = Config.load()
+        _config = _get_config()
         embedder = create_embedder(_config)
         _store = VectorStore(_config.chroma_db_path, embedder)
         _retriever = Retriever(_store)
@@ -259,23 +216,39 @@ def _result_to_dict(r) -> dict:
     Expects r.composite_score to be populated by reranker.
     """
     return {
+        "doc_id": r.doc_id,
         "doc_title": r.doc_title,
         "authors": r.authors,
         "year": r.year,
         "citation_key": r.citation_key,
         "publication": r.publication,
+        "journal_quartile": r.journal_quartile,
         "page": r.page_num,
+        "chunk_index": r.chunk_index,
         "relevance_score": round(r.score, 3),
         "composite_score": round(r.composite_score, 3) if r.composite_score is not None else None,
         "section": r.section,
         "section_confidence": round(r.section_confidence, 2),
-        "journal_quartile": r.journal_quartile,
-        "passage": r.text,
+        "passage_text": r.text,
         "context_before": r.context_before,
         "context_after": r.context_after,
         "full_context": r.full_context(),
-        "doc_id": r.doc_id,
-        "chunk_index": r.chunk_index,
+    }
+
+
+def _pack_search_response(
+    tool_name: str,
+    query: str,
+    top_k: int,
+    results: list[dict],
+) -> dict:
+    """Return a stable top-level shape for all semantic-search tools."""
+    return {
+        "tool": tool_name,
+        "query": query,
+        "top_k": top_k,
+        "result_count": len(results),
+        "results": results,
     }
 
 
@@ -336,10 +309,29 @@ def _select_diverse_passages(
 
 
 @mcp.tool()
+def health_check(include_index_stats: bool = True) -> dict:
+    """Report config, path resolution, embedding readiness, and optional index stats."""
+    config = _get_config()
+    status = collect_health_status(config)
+
+    if include_index_stats and not status["validation_errors"]:
+        try:
+            status["index_stats"] = get_index_stats()
+        except Exception as exc:
+            status["index_stats_error"] = f"{type(exc).__name__}: {exc}"
+
+    status["server"] = {
+        "name": "deep-zotero",
+        "transport_recommendation": "streamable-http",
+    }
+    return status
+
+
+@mcp.tool()
 def search_papers(
     query: str,
     top_k: int = 10,
-    context_chunks: int = 1,
+    context_window: int = 1,
     year_min: int | None = None,
     year_max: int | None = None,
     author: str | None = None,
@@ -349,7 +341,7 @@ def search_papers(
     section_weights: dict[str, float] | None = None,
     journal_weights: dict[str, float] | None = None,
     required_terms: list[str] | None = None,
-) -> list[dict]:
+) -> dict:
     """
     Semantic search over research paper chunks.
 
@@ -370,7 +362,7 @@ def search_papers(
     Args:
         query: Natural language search query
         top_k: Number of results (1-50)
-        context_chunks: Adjacent chunks to include (0-3)
+        context_window: Adjacent chunks to include (0-3)
         year_min: Minimum publication year filter
         year_max: Maximum publication year filter
         author: Filter by author name (case-insensitive substring match)
@@ -390,11 +382,13 @@ def search_papers(
             Use this to combine semantic search with exact keyword filtering.
 
     Returns:
-        List of results with passage text, context, and metadata
+        Dict with stable metadata and a results array of passages
     """
     start = time.perf_counter()
 
     _validate_search_inputs(chunk_types, section_weights, journal_weights)
+    top_k = max(1, min(top_k, 50))
+    context_window = max(0, min(context_window, 3))
 
     retriever = _get_retriever()
     reranker = _get_reranker()
@@ -407,7 +401,7 @@ def search_papers(
     results = retriever.search(
         query=query,
         top_k=fetch_k,
-        context_window=min(context_chunks, 3),
+        context_window=context_window,
         filters=_build_chromadb_filters(year_min, year_max, chunk_types)
     )
     results = _apply_text_filters(results, author, tag, collection)
@@ -426,13 +420,19 @@ def search_papers(
             top_results.append(result_with_score)
 
     logger.debug(f"search_papers: {time.perf_counter() - start:.3f}s")
-    return [_result_to_dict(r) for r in top_results]
+    return _pack_search_response(
+        tool_name="search_papers",
+        query=query,
+        top_k=top_k,
+        results=[_result_to_dict(r) for r in top_results],
+    )
 
 
 @mcp.tool()
 def search_topic(
     query: str,
-    num_papers: int = 10,
+    top_k: int = 10,
+    context_window: int = 1,
     year_min: int | None = None,
     year_max: int | None = None,
     author: str | None = None,
@@ -441,7 +441,8 @@ def search_topic(
     chunk_types: list[str] | None = None,
     section_weights: dict[str, float] | None = None,
     journal_weights: dict[str, float] | None = None,
-) -> list[dict]:
+    required_terms: list[str] | None = None,
+) -> dict:
     """
     Find the most relevant papers for a topic, deduplicated by document.
 
@@ -456,7 +457,8 @@ def search_topic(
 
     Args:
         query: Natural language topic description
-        num_papers: Number of distinct papers to return (1-50)
+        top_k: Number of distinct papers to return (1-50)
+        context_window: Adjacent chunks to include (0-3)
         year_min: Minimum publication year filter
         year_max: Maximum publication year filter
         author: Filter by author name (case-insensitive substring match)
@@ -473,49 +475,39 @@ def search_topic(
             Q3, Q4, unknown. Values are 0.0-1.0.
 
     Returns:
-        List of per-paper results with scores and best passage
+        Dict with stable metadata and a results array of papers
     """
     start = time.perf_counter()
-
-    # Validate chunk_types if provided
-    if chunk_types is not None:
-        invalid = set(chunk_types) - VALID_CHUNK_TYPES
-        if invalid:
-            raise ToolError(
-                f"Invalid chunk_types: {invalid}. "
-                f"Valid values: {', '.join(sorted(VALID_CHUNK_TYPES))}"
-            )
-
-    # Validate section_weights if provided
-    if section_weights is not None:
-        errors = validate_section_weights(section_weights)
-        if errors:
-            raise ToolError(f"Invalid section_weights: {'; '.join(errors)}")
-
-    # Validate journal_weights if provided
-    if journal_weights is not None:
-        errors = validate_journal_weights(journal_weights)
-        if errors:
-            raise ToolError(f"Invalid journal_weights: {'; '.join(errors)}")
+    _validate_search_inputs(chunk_types, section_weights, journal_weights)
+    top_k = max(1, min(top_k, 50))
+    context_window = max(0, min(context_window, 3))
 
     retriever = _get_retriever()
     reranker = _get_reranker()
 
     # Fetch more chunks than papers requested; double if text filters active
     base_fetch = min(
-        num_papers * _config.oversample_topic_factor * _config.oversample_multiplier,
+        top_k * _config.oversample_topic_factor * _config.oversample_multiplier,
         600
     )
-    fetch_k = base_fetch * 2 if _has_text_filters(author, tag, collection) else base_fetch
+    has_post_filters = _has_text_filters(author, tag, collection) or required_terms
+    fetch_k = base_fetch * 2 if has_post_filters else base_fetch
 
-    results = retriever.search(
+    t_search_base_start = time.perf_counter()
+    results = retriever.search_base(
         query=query,
         top_k=fetch_k,
-        context_window=1,
         filters=_build_chromadb_filters(year_min, year_max, chunk_types)
     )
-    results = _apply_text_filters(results, author, tag, collection)
+    search_base_ms = (time.perf_counter() - t_search_base_start) * 1000.0
 
+    t_post_filter_start = time.perf_counter()
+    results = _apply_text_filters(results, author, tag, collection)
+    if required_terms:
+        results = _apply_required_terms(results, required_terms)
+    post_filter_ms = (time.perf_counter() - t_post_filter_start) * 1000.0
+
+    t_rerank_group_start = time.perf_counter()
     # Rerank all results first (or bypass if disabled)
     if _config.rerank_enabled:
         reranked = reranker.rerank(results, section_weights, journal_weights)
@@ -548,31 +540,54 @@ def search_topic(
             "citation_key": best_hit.citation_key,
             "publication": best_hit.publication,
             "journal_quartile": best_hit.journal_quartile,
-            # Raw similarity scores
             "avg_score": round(sum(h.score for h in hits) / len(hits), 3),
             "best_chunk_score": round(best_hit.score, 3),
-            # Composite scores
             "avg_composite_score": round(avg_composite, 3),
             "best_composite_score": round(best_composite, 3),
-            "best_passage_section": best_hit.section,
-            "best_passage_section_confidence": round(best_hit.section_confidence, 2),
             "num_relevant_chunks": len(hits),
-            "best_passage": best_hit.text,
-            "best_passage_page": best_hit.page_num,
-            "best_passage_context": best_hit.full_context(),
+            "_lead_passage_hit": best_hit,
         })
 
     paper_results.sort(key=lambda p: p["avg_composite_score"], reverse=True)
-    logger.debug(f"search_topic: {time.perf_counter() - start:.3f}s")
-    return paper_results[:num_papers]
+    rerank_group_ms = (time.perf_counter() - t_rerank_group_start) * 1000.0
+
+    top_papers = paper_results[:top_k]
+
+    t_context_start = time.perf_counter()
+    lead_hits = [paper["_lead_passage_hit"] for paper in top_papers]
+    expanded_lead_hits = retriever.expand_context(lead_hits, context_window=context_window)
+    for paper, lead_hit in zip(top_papers, expanded_lead_hits):
+        paper["lead_passage"] = _result_to_dict(lead_hit)
+        del paper["_lead_passage_hit"]
+    final_context_expand_ms = (time.perf_counter() - t_context_start) * 1000.0
+
+    t_pack_start = time.perf_counter()
+    response = _pack_search_response(
+        tool_name="search_topic",
+        query=query,
+        top_k=top_k,
+        results=top_papers,
+    )
+    response_pack_ms = (time.perf_counter() - t_pack_start) * 1000.0
+    total_ms = (time.perf_counter() - start) * 1000.0
+    logger.debug(
+        "search_topic timings: "
+        f"search_base_ms={search_base_ms:.1f}, "
+        f"post_filter_ms={post_filter_ms:.1f}, "
+        f"rerank_group_ms={rerank_group_ms:.1f}, "
+        f"final_context_expand_ms={final_context_expand_ms:.1f}, "
+        f"response_pack_ms={response_pack_ms:.1f}, "
+        f"total_ms={total_ms:.1f}"
+    )
+    return response
 
 
 @mcp.tool()
 def search_diverse_papers(
     query: str,
-    num_papers: int = 8,
+    top_k: int = 8,
     passages_per_paper: int = 3,
-    context_chunks: int = 1,
+    context_window: int = 1,
     year_min: int | None = None,
     year_max: int | None = None,
     author: str | None = None,
@@ -582,7 +597,7 @@ def search_diverse_papers(
     section_weights: dict[str, float] | None = None,
     journal_weights: dict[str, float] | None = None,
     required_terms: list[str] | None = None,
-) -> list[dict]:
+) -> dict:
     """
     Diversified paper-level semantic search with multiple passages per paper.
 
@@ -593,9 +608,9 @@ def search_diverse_papers(
 
     Args:
         query: Natural language topic description
-        num_papers: Number of distinct papers to return (1-50)
+        top_k: Number of distinct papers to return (1-50)
         passages_per_paper: Max passages to keep per paper (1-5)
-        context_chunks: Adjacent chunks to include around each passage (0-3)
+        context_window: Adjacent chunks to include around each passage (0-3)
         year_min: Minimum publication year filter
         year_max: Maximum publication year filter
         author: Filter by author name (case-insensitive substring match)
@@ -614,19 +629,19 @@ def search_diverse_papers(
             kept passages (case-insensitive).
 
     Returns:
-        List of distinct papers with ranked passage lists and metadata.
+        Dict with stable metadata and a results array of papers.
     """
     start = time.perf_counter()
     _validate_search_inputs(chunk_types, section_weights, journal_weights)
 
-    num_papers = max(1, min(num_papers, 50))
+    top_k = max(1, min(top_k, 50))
     passages_per_paper = max(1, min(passages_per_paper, 5))
-    context_chunks = max(0, min(context_chunks, 3))
+    context_window = max(0, min(context_window, 3))
 
     retriever = _get_retriever()
 
     base_fetch = min(
-        num_papers
+        top_k
         * passages_per_paper
         * _config.oversample_topic_factor
         * _config.oversample_multiplier,
@@ -635,16 +650,21 @@ def search_diverse_papers(
     has_post_filters = _has_text_filters(author, tag, collection) or required_terms
     fetch_k = base_fetch * 2 if has_post_filters else base_fetch
 
-    results = retriever.search(
+    t_search_base_start = time.perf_counter()
+    results = retriever.search_base(
         query=query,
         top_k=fetch_k,
-        context_window=context_chunks,
         filters=_build_chromadb_filters(year_min, year_max, chunk_types)
     )
+    search_base_ms = (time.perf_counter() - t_search_base_start) * 1000.0
+
+    t_post_filter_start = time.perf_counter()
     results = _apply_text_filters(results, author, tag, collection)
     if required_terms:
         results = _apply_required_terms(results, required_terms)
+    post_filter_ms = (time.perf_counter() - t_post_filter_start) * 1000.0
 
+    t_rerank_group_start = time.perf_counter()
     reranked = _rerank_results(results, section_weights, journal_weights)
 
     by_doc: dict[str, list[RetrievalResult]] = defaultdict(list)
@@ -661,7 +681,7 @@ def search_diverse_papers(
             ),
             reverse=True,
         )
-        selected_hits = _select_diverse_passages(ranked_hits, passages_per_paper, context_chunks)
+        selected_hits = _select_diverse_passages(ranked_hits, passages_per_paper, context_window)
         if not selected_hits:
             continue
 
@@ -685,7 +705,7 @@ def search_diverse_papers(
             "best_passage_score": round(best_passage_score, 3),
             "num_selected_passages": len(selected_hits),
             "num_candidate_chunks": len(hits),
-            "passages": [_result_to_dict(hit) for hit in selected_hits],
+            "_selected_hits": selected_hits,
         })
 
     paper_results.sort(
@@ -696,8 +716,45 @@ def search_diverse_papers(
         ),
         reverse=True,
     )
-    logger.debug(f"search_diverse_papers: {time.perf_counter() - start:.3f}s")
-    return paper_results[:num_papers]
+    rerank_group_ms = (time.perf_counter() - t_rerank_group_start) * 1000.0
+
+    top_papers = paper_results[:top_k]
+
+    t_context_start = time.perf_counter()
+    hits_to_expand: list[RetrievalResult] = []
+    passage_counts: list[int] = []
+    for paper in top_papers:
+        selected_hits = paper.pop("_selected_hits")
+        passage_counts.append(len(selected_hits))
+        hits_to_expand.extend(selected_hits)
+
+    expanded_hits = retriever.expand_context(hits_to_expand, context_window=context_window)
+    offset = 0
+    for paper, count in zip(top_papers, passage_counts):
+        paper_hits = expanded_hits[offset:offset + count]
+        offset += count
+        paper["passages"] = [_result_to_dict(hit) for hit in paper_hits]
+    final_context_expand_ms = (time.perf_counter() - t_context_start) * 1000.0
+
+    t_pack_start = time.perf_counter()
+    response = _pack_search_response(
+        tool_name="search_diverse_papers",
+        query=query,
+        top_k=top_k,
+        results=top_papers,
+    )
+    response_pack_ms = (time.perf_counter() - t_pack_start) * 1000.0
+    total_ms = (time.perf_counter() - start) * 1000.0
+    logger.debug(
+        "search_diverse_papers timings: "
+        f"search_base_ms={search_base_ms:.1f}, "
+        f"post_filter_ms={post_filter_ms:.1f}, "
+        f"rerank_group_ms={rerank_group_ms:.1f}, "
+        f"final_context_expand_ms={final_context_expand_ms:.1f}, "
+        f"response_pack_ms={response_pack_ms:.1f}, "
+        f"total_ms={total_ms:.1f}"
+    )
+    return response
 
 
 @mcp.tool()
@@ -933,7 +990,21 @@ def get_passage_context(
     # Get section and journal_quartile from center chunk
     center_chunk = next((c for c in chunks if c.metadata["chunk_index"] == chunk_index), chunks[0])
 
-    return {
+    passages = [
+        {
+            "chunk_index": c.metadata["chunk_index"],
+            "page": c.metadata["page_num"],
+            "section": c.metadata.get("section", "unknown"),
+            "section_confidence": c.metadata.get("section_confidence", 1.0),
+            "text": c.text,
+            "is_center": c.metadata["chunk_index"] == chunk_index,
+        }
+        for c in chunks
+    ]
+    merged_text = "\n\n".join(c.text for c in chunks if c.text)
+    has_text = bool(merged_text.strip())
+
+    response = {
         "doc_id": doc_id,
         "doc_title": chunks[0].metadata.get("doc_title", "Unknown"),
         "citation_key": chunks[0].metadata.get("citation_key", ""),
@@ -942,19 +1013,14 @@ def get_passage_context(
         "journal_quartile": center_chunk.metadata.get("journal_quartile") or None,
         "center_chunk_index": chunk_index,
         "window": window,
-        "passages": [
-            {
-                "chunk_index": c.metadata["chunk_index"],
-                "page": c.metadata["page_num"],
-                "section": c.metadata.get("section", "unknown"),
-                "section_confidence": c.metadata.get("section_confidence", 1.0),
-                "text": c.text,
-                "is_center": c.metadata["chunk_index"] == chunk_index,
-            }
-            for c in chunks
-        ],
-        "merged_text": "\n\n".join(c.text for c in chunks),
+        "result_count": len(passages),
+        "passages": passages,
+        "merged_text": merged_text,
+        "has_text": has_text,
     }
+    if not has_text:
+        response["empty_reason"] = "chunk_text_missing"
+    return response
 
 
 def _get_table_reference_context(
@@ -1001,8 +1067,11 @@ def _get_table_reference_context(
             "table_caption": table_caption,
             "table_page": table_page,
             "table_index": table_index,
+            "result_count": 0,
             "passages": [],
             "merged_text": "",
+            "has_text": False,
+            "empty_reason": "table_reference_not_found",
         }
 
     # Extract table number from caption (e.g., "Table 1: Results" -> "1")
@@ -1034,8 +1103,11 @@ def _get_table_reference_context(
             "table_caption": table_caption,
             "table_page": table_page,
             "table_index": table_index,
+            "result_count": 0,
             "passages": [],
             "merged_text": "",
+            "has_text": False,
+            "empty_reason": "table_reference_not_found",
         }
 
     # Found reference - get context around it
@@ -1048,7 +1120,20 @@ def _get_table_reference_context(
     if not center_chunk:
         raise ToolError(f"Could not retrieve context for chunk {matching_chunk_idx}")
 
-    return {
+    passages = [
+        {
+            "chunk_index": c.metadata["chunk_index"],
+            "page": c.metadata["page_num"],
+            "section": c.metadata.get("section", "unknown"),
+            "text": c.text,
+            "is_center": c.metadata["chunk_index"] == matching_chunk_idx,
+        }
+        for c in context_chunks
+    ]
+    merged_text = "\n\n".join(c.text for c in context_chunks if c.text)
+    has_text = bool(merged_text.strip())
+
+    response = {
         "doc_id": doc_id,
         "doc_title": center_chunk.metadata.get("doc_title", "Unknown"),
         "citation_key": center_chunk.metadata.get("citation_key", ""),
@@ -1060,22 +1145,19 @@ def _get_table_reference_context(
         "section_confidence": center_chunk.metadata.get("section_confidence", 1.0),
         "center_chunk_index": matching_chunk_idx,
         "window": window,
-        "passages": [
-            {
-                "chunk_index": c.metadata["chunk_index"],
-                "page": c.metadata["page_num"],
-                "section": c.metadata.get("section", "unknown"),
-                "text": c.text,
-                "is_center": c.metadata["chunk_index"] == matching_chunk_idx,
-            }
-            for c in context_chunks
-        ],
-        "merged_text": "\n\n".join(c.text for c in context_chunks),
+        "result_count": len(passages),
+        "passages": passages,
+        "merged_text": merged_text,
+        "has_text": has_text,
     }
+    if not has_text:
+        response["empty_reason"] = "chunk_text_missing"
+    return response
 
 
 @mcp.tool()
 def index_library(
+    mode: str = "update",
     force_reindex: bool = False,
     limit: int | None = None,
     item_key: str | None = None,
@@ -1091,7 +1173,8 @@ def index_library(
     unless force_reindex is True.
 
     Args:
-        force_reindex: Delete and rebuild index for all matching items
+        mode: "update" for incremental indexing, "rebuild" for full rebuild
+        force_reindex: Backward-compatible alias for rebuild
         limit: Maximum number of items to index (None = all)
         item_key: Index only this specific Zotero item key
         title_pattern: Regex pattern to filter items by title (case-insensitive)
@@ -1105,7 +1188,7 @@ def index_library(
 
     global _config
     if _config is None:
-        _config = Config.load()
+        _config = _get_config()
 
     errors = _config.validate()
     if errors:
@@ -1116,17 +1199,20 @@ def index_library(
         from dataclasses import replace as dc_replace
         config = dc_replace(_config, vision_enabled=False)
 
+    if mode not in {"update", "rebuild"}:
+        raise ToolError("mode must be one of: update, rebuild")
     if ocr_mode not in {"auto", "always", "off"}:
         raise ToolError("ocr_mode must be one of: auto, always, off")
 
-    tmp_dir = config.chroma_db_path.parent / "tmp"
+    rebuild = force_reindex or mode == "rebuild"
+    tmp_dir = config.runtime_tmp_dir
     tmp_dir.mkdir(parents=True, exist_ok=True)
     for tmp_env in ("TMP", "TEMP", "TMPDIR"):
         os.environ[tmp_env] = str(tmp_dir)
 
     indexer = Indexer(config)
     result = indexer.index_all(
-        force_reindex=force_reindex,
+        force_reindex=rebuild,
         limit=limit,
         item_key=item_key,
         title_pattern=title_pattern,
@@ -1147,6 +1233,8 @@ def index_library(
         })
 
     return {
+        "mode": mode,
+        "rebuild": rebuild,
         "results": serialized_results,
         "indexed": result["indexed"],
         "failed": result["failed"],
@@ -1200,6 +1288,55 @@ def get_index_stats() -> dict:
         "section_coverage": dict(section_counts),
         "journal_coverage": dict(journal_counts),
         "chunk_types": dict(chunk_type_counts),
+    }
+
+
+@mcp.tool()
+def get_search_guide() -> dict:
+    """Return a concise machine-readable guide for semantic-search workflows."""
+    return {
+        "canonical_entrypoints": {
+            "http_example": "deep-zotero.exe --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp",
+            "stdio_command": "deep-zotero.exe --transport stdio",
+        },
+        "tool_roles": {
+            "search_diverse_papers": "Broad paper discovery with multiple passages per paper.",
+            "search_papers": "Passage-level retrieval when you need the strongest exact evidence.",
+            "search_topic": "Paper-level ranking with a single lead passage per paper.",
+            "get_passage_context": "Expand context around a returned passage.",
+        },
+        "shared_search_params": {
+            "query": "Natural-language query string.",
+            "top_k": "Maximum number of returned papers or passages.",
+            "context_window": "Adjacent chunks to include when available.",
+            "required_terms": "Optional whole-word filter applied after semantic retrieval.",
+        },
+        "query_templates": [
+            {
+                "name": "broad_discovery",
+                "chinese": "\u5bb6\u65cf\u4f01\u4e1a \u4f20\u627f",
+                "english": "family business succession",
+            },
+            {
+                "name": "mechanism_split",
+                "chinese": "\u5bb6\u65cf\u4f01\u4e1a \u4f20\u627f \u8fdd\u7ea6\u98ce\u9669",
+                "english": "family business succession default risk",
+            },
+            {
+                "name": "exact_evidence",
+                "pattern": "Use a known title, author, or distinctive phrase with search_papers.",
+            },
+            {
+                "name": "gap_check",
+                "english": "succession risk / succession performance / succession productivity",
+            },
+        ],
+        "recommended_sequence": [
+            "get_index_stats",
+            "search_diverse_papers",
+            "search_papers",
+            "get_passage_context",
+        ],
     }
 
 
@@ -1550,6 +1687,44 @@ def get_vision_costs(last_n: int = 10) -> dict:
     }
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="deep-zotero",
+        description="Run the deep-zotero MCP server over stdio or streamable HTTP.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http"),
+        default="streamable-http",
+        help="Transport to use for the MCP server.",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP transport.")
+    parser.add_argument("--port", type=int, default=8765, help="Port for HTTP transport.")
+    parser.add_argument("--path", default="/mcp", help="Path for HTTP transport.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    try:
+        bootstrap_mcp_server(transport=args.transport)
+    except Exception as exc:
+        print(f"deep-zotero failed to start: {type(exc).__name__}: {exc}", file=os.sys.stderr)
+        return 1
+    run_kwargs = {"show_banner": False, "log_level": "error"}
+    if args.transport == "streamable-http":
+        run_kwargs.update(
+            {
+                "host": args.host,
+                "port": args.port,
+                "path": args.path,
+                "stateless_http": True,
+                "json_response": True,
+            }
+        )
+    mcp.run(transport=args.transport, **run_kwargs)
+    return 0
+
+
 if __name__ == "__main__":
-    _start_parent_monitor()
-    mcp.run(show_banner=False, log_level="error")
+    raise SystemExit(main())

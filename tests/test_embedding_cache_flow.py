@@ -36,7 +36,7 @@ def _build_indexer(tmp_path: Path, item: ZoteroItem) -> Indexer:
         embedding_provider="local",
         embedding_model="all-MiniLM-L6-v2",
         embedding_dimensions=384,
-        embedding_base_url=None,
+        embedding_device=None,
     )
     indexer.zotero = MagicMock()
     indexer.zotero.get_all_items_with_pdfs.return_value = [item]

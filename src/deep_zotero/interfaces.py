@@ -78,6 +78,12 @@ class VectorStoreProtocol(Protocol):
         """Get chunks adjacent to a given chunk."""
         ...
 
+    def get_adjacent_chunks_batch(
+        self, centers: list[tuple[str, int]], window: int = 2
+    ) -> dict[tuple[str, int], list[StoredChunk]]:
+        """Get chunks adjacent to multiple center chunks."""
+        ...
+
     def delete_document(self, doc_id: str) -> None:
         """Delete all chunks for a document."""
         ...
@@ -102,6 +108,23 @@ class RetrieverProtocol(Protocol):
         filters: dict | None = None
     ) -> list[RetrievalResult]:
         """Search and expand context."""
+        ...
+
+    def search_base(
+        self,
+        query: str,
+        top_k: int = 10,
+        filters: dict | None = None,
+    ) -> list[RetrievalResult]:
+        """Search without context expansion."""
+        ...
+
+    def expand_context(
+        self,
+        results: list[RetrievalResult],
+        context_window: int = 1,
+    ) -> list[RetrievalResult]:
+        """Expand context for a preselected result list."""
         ...
 
 

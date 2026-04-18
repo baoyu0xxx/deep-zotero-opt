@@ -47,7 +47,7 @@ def _config_hash(config: Config) -> str:
         f"{config.embedding_provider}:"
         f"{config.embedding_dimensions}:"
         f"{config.embedding_model}:"
-        f"{config.embedding_base_url}:"
+        f"{config.embedding_device}:"
         f"{config.ocr_language}"
     )
     return hashlib.sha256(data.encode()).hexdigest()[:16]
@@ -236,7 +236,7 @@ class Indexer:
             "embedding_provider": self.config.embedding_provider,
             "embedding_model": self.config.embedding_model,
             "embedding_dimensions": self.config.embedding_dimensions,
-            "embedding_base_url": self.config.embedding_base_url,
+            "embedding_device": self.config.embedding_device,
         }
 
     def _embedding_cache_path(self, meta: dict) -> Path:
